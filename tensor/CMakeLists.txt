@@ -1,5 +1,5 @@
 find_package(OpenMP REQUIRED)
-find_package(Armadillo REQUIRED)
+# find_package(Armadillo REQUIRED)
 find_package(glog REQUIRED)
 find_package(BLAS REQUIRED)
 find_package(LAPACK REQUIRED)

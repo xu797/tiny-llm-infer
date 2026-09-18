@@ -155,8 +155,7 @@ TEST(test_tensor, assign1)
     {
         ptr[i] = float(i);
     }
-    std::shared_ptr<Buffer> buffer =
-            std::make_shared<Buffer>(size * sizeof(float), nullptr, ptr, true);
+    std::shared_ptr<Buffer> buffer = std::make_shared<Buffer>(size * sizeof(float), nullptr, ptr, true);
     buffer->set_device_type(DeviceType::kDeviceCPU);
 
     ASSERT_EQ(t1_cpu.assign(buffer), true);
