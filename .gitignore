@@ -1,0 +1,16 @@
+# CMake构建输出
+build/
+*/build/
+
+# 编译产生的临时文件
+*.o
+*.so
+*.a
+*.out
+
+
+# vscode
+.vscode/
+*.swp
+*.swo
+
