@@ -1,3 +1,5 @@
+#include <cuda_runtime.h>
+
 #include "cuda_alloc.h"
 
 namespace my_vllm

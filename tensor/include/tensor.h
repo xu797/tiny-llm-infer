@@ -43,12 +43,6 @@ public:
 
     void init_buffer(std::shared_ptr<DeviceAllocator> alloc, DataType data_type, bool need_alloc, void *ptr);
 
-    template <typename T>
-    T *ptr();
-
-    template <typename T>
-    const T *ptr() const;
-
     void reshape(const std::vector<int32_t> &dims);
 
     std::shared_ptr<Buffer> get_buffer() const;
@@ -76,6 +70,14 @@ public:
     DeviceType device_type() const;
 
     bool allocate(std::shared_ptr<DeviceAllocator> allocator, bool need_realloc = false);
+    
+    Tensor clone() const;
+
+    template <typename T>
+    T *ptr();
+
+    template <typename T>
+    const T *ptr() const;
 
     template <typename T>
     T *ptr(int64_t index);
@@ -88,8 +90,6 @@ public:
 
     template <typename T>
     const T &index(int64_t offset) const;
-
-    tensor::Tensor clone() const;
 
 private:
     size_t size_ = 0;
@@ -147,8 +147,7 @@ T *Tensor::ptr(int64_t index)
 template <typename T>
 const T *Tensor::ptr(int64_t index) const
 {
-    CHECK(buffer_ != nullptr && buffer_->ptr() != nullptr)
-        << "The data area buffer of this tensor is empty or it points to a null pointer.";
+    CHECK(buffer_ != nullptr && buffer_->ptr() != nullptr) << "The data area buffer of this tensor is empty or it points to a null pointer.";
     return reinterpret_cast<const T *>(buffer_->ptr()) + index;
 }
 } // namespace  my_vllm
