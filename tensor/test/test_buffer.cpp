@@ -12,7 +12,9 @@ TEST(test_buffer, allocate)
 {
     using namespace my_vllm;
     auto alloc = CPUDeviceAllocatorFactory::get_instance();
+    // alloc:CPUDeviceAllocator
     Buffer buffer(32, alloc);
+    //32 byte, device = cpu 
     ASSERT_NE(buffer.ptr(), nullptr);
 }
 
@@ -23,6 +25,7 @@ TEST(test_buffer, use_external)
     float *ptr = new float[32];
     Buffer buffer(32, nullptr, ptr, true);
     ASSERT_EQ(buffer.is_external(), true);
+    //buffer.is_external() == true
     delete[] ptr;
 }
 
