@@ -10,3 +10,6 @@ include_directories(${PROJECT_SOURCE_DIR})
 add_subdirectory(tensor)
 add_subdirectory(memory)
 add_subdirectory(utils)
+add_subdirectory(layers)
+add_subdirectory(kernels)
+

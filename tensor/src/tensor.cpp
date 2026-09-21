@@ -352,4 +352,11 @@ size_t Tensor::size() const
     return this->size_; 
 }
 
+int32_t Tensor::get_dim(int32_t idx) const 
+{
+    CHECK_GE(idx, 0);
+    CHECK_LT(idx, this->dims_.size());
+    return this->dims_.at(idx);
+}
+
 }
