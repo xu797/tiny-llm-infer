@@ -19,6 +19,9 @@ typedef void (*MatmulKernelQuant)(const Tensor& input, const Tensor& weight,
                                   const Tensor& scale, const CudaConfig* config);
 MatmulKernelQuant get_matmul_kernel_quant8(DeviceType device_type);
 
+typedef void (*EmbeddingKernel)(const Tensor& input, const Tensor& weight,
+                                const Tensor& output, int32_t vocab_size, void* stream);
+EmbeddingKernel get_emb_kernel(DeviceType device_type);
 
 }
 
