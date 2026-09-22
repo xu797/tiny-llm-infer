@@ -3,6 +3,8 @@
 #include "add_kernel_cuda.cuh"
 #include "matmul_kernel_cpu.h"
 #include "matmul_kernel_cuda.cuh"
+#include "embed_kernel_cpu.h"
+#include "embed_kernel_cuda.cuh"
 
 namespace my_vllm
 {
@@ -49,6 +51,23 @@ MatmulKernelQuant get_matmul_kernel_quant8(DeviceType device_type)
     else 
     {
         LOG(FATAL) << "Unknown device type for get an matmul kernel.";
+        return nullptr;
+    }
+}
+
+EmbeddingKernel get_emb_kernel(DeviceType device_type) 
+{
+    if (device_type == DeviceType::kDeviceCPU) 
+    {
+        return emb_kernel_normal;
+    } 
+    else if (device_type == DeviceType::kDeviceCUDA) 
+    {
+        return emb_kernel_cu;
+    } 
+    else 
+    {
+        LOG(FATAL) << "Unknown device type for get an embedding kernel.";
         return nullptr;
     }
 }
