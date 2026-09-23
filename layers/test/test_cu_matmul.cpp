@@ -9,7 +9,7 @@
 #include "utils.cuh"
 #include "buffer.h"
 
-// using namespace kernel;
+
 TEST(test_matmul_cu, matmul_linear_stream5)
 {
     using namespace my_vllm;

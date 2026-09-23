@@ -18,8 +18,7 @@ namespace my_vllm
 class Model 
 {
 public:
-    explicit Model(TokenizerType tokenizer_type, ModelType model_type,
-                    std::string token_path, std::string model_path, bool is_quant_model);
+    explicit Model(TokenizerType tokenizer_type, ModelType model_type, std::string token_path, std::string model_path, bool is_quant_model);
 
     virtual Status init(DeviceType device_type) = 0;
 

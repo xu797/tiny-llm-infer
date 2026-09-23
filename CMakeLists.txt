@@ -12,4 +12,4 @@ add_subdirectory(memory)
 add_subdirectory(utils)
 add_subdirectory(layers)
 add_subdirectory(kernels)
-
+add_subdirectory(model)

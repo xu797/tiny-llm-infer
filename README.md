@@ -1,2 +1,3 @@
 # tiny-llm-infer
 ...
+rmsnorm cpu实现 目前是把所有的token放在一块算，应该独立算。
