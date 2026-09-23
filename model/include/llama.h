@@ -11,7 +11,7 @@
 namespace my_vllm
 {
 
-struct LLama2Layers 
+struct LLama2Layers
 {
   std::shared_ptr<Layer> add_layer_;
   std::shared_ptr<Layer> rope_layer_;
@@ -34,19 +34,16 @@ struct LLama2Layers
   void to_cuda(std::shared_ptr<CudaConfig> config);
 };
 
-class LLama2Model : public Model 
+class LLama2Model : public Model
 {
 public:
-    explicit LLama2Model(TokenizerType tokenizer_type, std::string token_path,
-                        std::string model_path, bool is_quant_model);
+    explicit LLama2Model(TokenizerType tokenizer_type, std::string token_path, std::string model_path, bool is_quant_model);
 
     Status init(DeviceType device_type) override;
 
-    Status predict(const Tensor& input, const Tensor& pos_tensor,
-                        bool is_prompt, int& next) const override;
+    Status predict(const Tensor& input, const Tensor& pos_tensor, bool is_prompt, int& next) const override;
 
-    Status forward(const Tensor& input, const Tensor& pos_tensor,
-                        int& next) const override;
+    Status forward(const Tensor& input, const Tensor& pos_tensor, int& next) const override;
 
     std::vector<int32_t> encode(const std::string& sentence) const override;
 
@@ -62,7 +59,7 @@ public:
 
     Tensor fill_input(const Tensor& pos_tensor, const EmbeddingOutput& embedding_output, bool is_prompt) const;
 
-private:
+// private:
     void init_mem() override;
 
     Status create_layers() override;
@@ -85,10 +82,10 @@ private:
 
     int32_t post_processing(const Tensor& pos, bool is_prompt) const override;
 
-private:
+// private:
     std::shared_ptr<CudaConfig> cuda_config_;
     std::unique_ptr<LLama2Layers> llama_layers_;
 };
-}  
+}
 
 #endif
