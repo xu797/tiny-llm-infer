@@ -26,10 +26,13 @@ struct LLama2Layers
   std::vector<std::shared_ptr<Layer>> w1_layers_;
   std::vector<std::shared_ptr<Layer>> w2_layers_;
   std::vector<std::shared_ptr<Layer>> rmsnorm_layers_;
+  std::vector<std::shared_ptr<Layer>> qnorm_layers_;
+  std::vector<std::shared_ptr<Layer>> knorm_layers_;
   std::vector<std::shared_ptr<Layer>> w3_layers_;
   std::shared_ptr<Layer> cls_layer_;
 
   std::shared_ptr<Layer> embedding_layer_;
+  bool tied_weights_ = false;
 
   void to_cuda(std::shared_ptr<CudaConfig> config);
 };
@@ -38,10 +41,13 @@ class LLama2Model : public Model
 {
 public:
     explicit LLama2Model(TokenizerType tokenizer_type, std::string token_path, std::string model_path, bool is_quant_model);
+    ~LLama2Model() override;
 
     Status init(DeviceType device_type) override;
 
     Status predict(const Tensor& input, const Tensor& pos_tensor, bool is_prompt, int& next) const override;
+
+    Status generate(const std::string& prompt, int32_t max_new_tokens, std::string& output);
 
     Status forward(const Tensor& input, const Tensor& pos_tensor, int& next) const override;
 

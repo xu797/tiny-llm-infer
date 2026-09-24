@@ -2,6 +2,7 @@
 #define MYVLLM_LAYERS_ENCODE_H_
 
 #include <sentencepiece_processor.h>
+#include <unordered_map>
 
 #include "layer.h"
 
@@ -93,6 +94,35 @@ public:
     explicit QwenEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos);
 };
 #endif
+
+// Tokenizer for the Qwen3 tokenizer.json (ByteLevel BPE, without a RE2
+// dependency). This is intentionally separate from the legacy Qwen2 helper.
+class Qwen3EncodeLayer : public EncodeLayerBase
+{
+public:
+    explicit Qwen3EncodeLayer(std::string token_model_path, bool has_bos = false,
+                              bool has_eos = false);
+
+    std::vector<int32_t> encode(const std::string& sentence) const override;
+    std::string decode(int32_t token_id) const override;
+    std::string decode(const std::vector<int32_t>& token_ids) const override;
+    bool is_sentence_ending(int32_t token_id) const override;
+    int32_t vocab_size() const override;
+
+private:
+    void encode_ordinary(const std::string& text, std::vector<int32_t>& output) const;
+    std::vector<int32_t> encode_piece(const std::string& piece) const;
+
+    std::unordered_map<std::string, int32_t> encoder_;
+    std::unordered_map<int32_t, std::string> decoder_;
+    std::unordered_map<std::string, int32_t> special_encoder_;
+    std::unordered_map<int32_t, std::string> special_decoder_;
+    std::unordered_map<std::string, int32_t> merge_ranks_;
+    std::vector<std::string> special_tokens_;
+    int32_t num_token_ = 0;
+    int32_t eos_id_ = -1;
+    int32_t endoftext_id_ = -1;
+};
 
 }
 

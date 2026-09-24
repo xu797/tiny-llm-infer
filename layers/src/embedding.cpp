@@ -20,16 +20,27 @@ Status EmbeddingLayer::check() const
 {
     const auto& input_tensor = get_input(0);
     const auto& token_size = get_input(1).size();
-    if (token_size > input_tensor.size())
+    if (token_size > static_cast<size_t>(seq_len_) || token_size != input_tensor.size())
     {
-        return InvalidArgument("The number of input tensor is greater than seq len.");
+        return InvalidArgument("The input token count is invalid for the model context window.");
     }
 
-    Status status = check_tensor_with_dim(input_tensor, DeviceType::kDeviceCPU, DataType::kDataTypeInt32, token_size);
+    const int32_t token_count = static_cast<int32_t>(token_size);
+    Status status = check_tensor_with_dim(input_tensor, DeviceType::kDeviceCPU,
+                                          DataType::kDataTypeInt32, token_count);
     if (!status)
     {
         LOG(ERROR) << "The input tensor error in the embedding layer.";
         return status;
+    }
+
+    for (size_t i = 0; i < token_size; ++i)
+    {
+        const int32_t token = input_tensor.ptr<int32_t>()[i];
+        if (token < 0 || token >= vocab_size_)
+        {
+            return InvalidArgument("An input token id is outside the embedding vocabulary.");
+        }
     }
 
     status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, vocab_size_, dim_);
@@ -39,7 +50,7 @@ Status EmbeddingLayer::check() const
         return status;
     }
 
-    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, token_size, dim_);
+    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, token_count, dim_);
     if (!status)
     {
         LOG(ERROR) << "The output tensor error in the embedding layer.";

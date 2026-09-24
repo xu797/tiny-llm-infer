@@ -2,6 +2,7 @@
 #include "argmax_kernel_cuda.cuh"
 #include "tensor.h"
 #include "cuda_alloc.h"
+#include <cfloat>
 
 namespace my_vllm
 {
@@ -63,17 +64,12 @@ __global__ void argmax_kernel_fp32(const float* input_ptr, size_t size, size_t* 
 {
     __shared__ size_t shared_max_ptr[32];
     __shared__ float shared_max_value[32];
-    uint32_t tid = threadIdx.x;
-    if (tid >= size) 
-    {
-        return;
-    }
-
-    size_t max_index = threadIdx.x;
-    float max_value = input_ptr[max_index];
+    const uint32_t tid = threadIdx.x;
+    size_t max_index = SIZE_MAX;
+    float max_value = -FLT_MAX;
     for (size_t i = tid; i < size; i += blockDim.x) 
     {
-        if (input_ptr[i] > max_value) 
+        if (input_ptr[i] > max_value || (input_ptr[i] == max_value && i < max_index))
         {
             max_index = i;
             max_value = input_ptr[i];
@@ -90,20 +86,27 @@ __global__ void argmax_kernel_fp32(const float* input_ptr, size_t size, size_t* 
 
 size_t argmax_kernel_cu(const float* input_ptr, size_t size, void* stream) 
 {
+    CHECK_NE(input_ptr, nullptr);
+    CHECK_GT(size, 0);
     std::shared_ptr<DeviceAllocator> alloc_cu = CUDADeviceAllocatorFactory::get_instance();
     size_t* index = static_cast<size_t*>(alloc_cu->allocate(sizeof(size_t)));
+    CHECK_NE(index, nullptr);
     size_t output_index = 0;
     if (!stream) 
     {
         argmax_kernel_fp32<<<1, 512>>>(input_ptr, size, index);
-        cudaMemcpy(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost);
+        CHECK_EQ(cudaGetLastError(), cudaSuccess);
+        CHECK_EQ(cudaMemcpy(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost), cudaSuccess);
     } 
     else 
     {
         cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
         argmax_kernel_fp32<<<1, 512, 0, stream_>>>(input_ptr, size, index);
-        cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
+        CHECK_EQ(cudaGetLastError(), cudaSuccess);
+        CHECK_EQ(cudaMemcpyAsync(&output_index, index, sizeof(size_t), cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+        CHECK_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     }
+    alloc_cu->release(index);
     return output_index;
 }
-} 
+}

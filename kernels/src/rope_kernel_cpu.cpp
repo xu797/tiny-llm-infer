@@ -122,4 +122,59 @@ void rope_kernel_cpu(int32_t dim, int32_t kv_dim, int32_t head_size, const Tenso
   }
 }
 #endif
-}  // namespace kernel
+
+void qwen3_sin_cos_cache_calc_cpu(int32_t head_size, int32_t max_seq_len, float rope_theta,
+                                  float* sin_cache, float* cos_cache)
+{
+  const int32_t half = head_size / 2;
+  for (int32_t pos = 0; pos < max_seq_len; ++pos)
+  {
+    for (int32_t i = 0; i < half; ++i)
+    {
+      const float frequency = std::pow(rope_theta, -2.0f * static_cast<float>(i) / head_size);
+      const float angle = static_cast<float>(pos) * frequency;
+      sin_cache[pos * head_size + i] = std::sin(angle);
+      cos_cache[pos * head_size + i] = std::cos(angle);
+    }
+  }
+}
+
+void qwen3_rope_kernel_cpu(int32_t query_heads, int32_t kv_heads, int32_t head_size,
+                           const Tensor& input_q, const Tensor& input_k,
+                           const Tensor& input_pos, const Tensor& sin_cache,
+                           const Tensor& cos_cache, void* stream)
+{
+  UNUSED(stream);
+  const int32_t pos = input_pos.ptr<int32_t>()[0];
+  const float* sin_row = sin_cache.ptr<float>() + pos * head_size;
+  const float* cos_row = cos_cache.ptr<float>() + pos * head_size;
+  float* query = const_cast<float*>(input_q.ptr<float>());
+  float* key = const_cast<float*>(input_k.ptr<float>());
+  const int32_t half = head_size / 2;
+
+  for (int32_t head = 0; head < query_heads; ++head)
+  {
+    for (int32_t i = 0; i < half; ++i)
+    {
+      const int32_t first = head * head_size + i;
+      const int32_t second = first + half;
+      const float x = query[first];
+      const float y = query[second];
+      query[first] = x * cos_row[i] - y * sin_row[i];
+      query[second] = x * sin_row[i] + y * cos_row[i];
+    }
+  }
+  for (int32_t head = 0; head < kv_heads; ++head)
+  {
+    for (int32_t i = 0; i < half; ++i)
+    {
+      const int32_t first = head * head_size + i;
+      const int32_t second = first + half;
+      const float x = key[first];
+      const float y = key[second];
+      key[first] = x * cos_row[i] - y * sin_row[i];
+      key[second] = x * sin_row[i] + y * cos_row[i];
+    }
+  }
+}
+}  // namespace my_vllm

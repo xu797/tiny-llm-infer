@@ -16,5 +16,4 @@ build/
 
 llama2/
 
-model/test/
-
+Qwen3-0.6B/

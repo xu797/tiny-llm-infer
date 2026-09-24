@@ -54,6 +54,7 @@ enum class ModelType : uint8_t
 {
     kModelTypeUnknown = 0,
     kModelTypeLLama2 = 1,
+    kModelTypeQwen3 = 2,
 };  
 
 inline size_t DataTypeSize(DataType data_type) 

@@ -5,26 +5,16 @@
 namespace my_vllm
 {
 template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_f32(float* in, float* wei, float* out, int size, float eps) 
+static __global__ void row_rmsnorm_f32(const float* in, const float* wei, float* out,
+                                       int row_size, float eps)
 {
     const int tid = threadIdx.x;
-
-    constexpr int pack_size = 4;
-    const int pack_num = size / pack_size;
-    const int pack_off = pack_size * pack_num;
+    const int row = blockIdx.x;
+    in += row * row_size;
+    out += row * row_size;
 
     float sum = 0.0f;
-    float4* in_pack = reinterpret_cast<float4*>(in);
-    for (int i = tid; i < pack_num; i += blockDim.x) 
-    {
-        float4 in_float4 = *(in_pack + i);
-        sum += in_float4.x * in_float4.x;
-        sum += in_float4.y * in_float4.y;
-        sum += in_float4.z * in_float4.z;
-        sum += in_float4.w * in_float4.w;
-    }
-
-    for (int i = pack_off + tid; i < size; i += blockDim.x) 
+    for (int i = tid; i < row_size; i += blockDim.x)
     {
         sum += in[i] * in[i];
     }
@@ -39,26 +29,15 @@ static __global__ void row_rmsnorm_f32(float* in, float* wei, float* out, int si
     }
     __syncthreads();
     sum = shared_val;
-    const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
-
-    float4* wei_pack = reinterpret_cast<float4*>(wei);
-    float4* out_pack = reinterpret_cast<float4*>(out);
-    for (int i = tid; i < pack_num; i += blockDim.x) 
-    {
-        float4 in_float4 = *(in_pack + i);
-        float4 wei_float4 = *(wei_pack + i);
-        *(out_pack + i) =
-            make_float4(scale * in_float4.x * wei_float4.x, scale * in_float4.y * wei_float4.y,
-                        scale * in_float4.z * wei_float4.z, scale * in_float4.w * wei_float4.w);
-    }
-
-    for (int i = pack_off + tid; i < size; i += blockDim.x) 
+    const float scale = rsqrtf(sum / static_cast<float>(row_size) + eps);
+    for (int i = tid; i < row_size; i += blockDim.x)
     {
         out[i] = wei[i] * in[i] * scale;
     }
 }
 
-void rmsnorm_kernel_cu(const Tensor& input, const Tensor& weight, const Tensor& output, void* stream) 
+void rmsnorm_kernel_cu(const Tensor& input, const Tensor& weight, const Tensor& output,
+                       void* stream, float eps)
 {
     CHECK(!input.is_empty());
     CHECK(!weight.is_empty());
@@ -68,24 +47,23 @@ void rmsnorm_kernel_cu(const Tensor& input, const Tensor& weight, const Tensor& 
         weight.device_type() == DeviceType::kDeviceCUDA &&
         output.device_type() == DeviceType::kDeviceCUDA);
 
-    #ifdef QWEN2_SUPPORT
-        const float eps = 1e-6f;
-    #else
-        const float eps = 1e-5f;
-    #endif
-    const int32_t size = static_cast<int32_t>(input.size());
-    float* in_ptr = const_cast<float*>(input.ptr<float>());
+    const int32_t row_size = static_cast<int32_t>(weight.size());
+    CHECK_GT(row_size, 0);
+    CHECK_EQ(input.size() % row_size, 0);
+    CHECK_EQ(output.size(), input.size());
+    const int32_t row_num = static_cast<int32_t>(input.size() / row_size);
+    const float* in_ptr = input.ptr<float>();
     float* wei_ptr = const_cast<float*>(weight.ptr<float>());
     float* out_ptr = const_cast<float*>(output.ptr<float>());
     constexpr int threads_num = 128;
     if (stream) 
     {
         cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-        row_rmsnorm_f32<128><<<1, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, size, eps);
+        row_rmsnorm_f32<128><<<row_num, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, row_size, eps);
     } 
     else
     {
-        row_rmsnorm_f32<128><<<1, threads_num>>>(in_ptr, wei_ptr, out_ptr, size, eps);
+        row_rmsnorm_f32<128><<<row_num, threads_num>>>(in_ptr, wei_ptr, out_ptr, row_size, eps);
     }
 }
 }  // namespace kernel
