@@ -37,5 +37,7 @@ target_include_directories(model_main PUBLIC ${PROJECT_SOURCE_DIR}/utils/include
 target_include_directories(model_main PUBLIC ${PROJECT_SOURCE_DIR}/tensor/include)
 target_include_directories(model_main PUBLIC ${PROJECT_SOURCE_DIR}/kernels/include)
 target_include_directories(model_main PUBLIC ${PROJECT_SOURCE_DIR}/layers/include)
+target_compile_definitions(model_main PRIVATE MYVLLM_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 enable_testing()
+add_test(NAME model_tests COMMAND model_main)
