@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "qwen3.h"
+#include "add.h"
 #include "argmax_sampler.h"
 #include "cuda_alloc.h"
 #include "cpu_alloc.h"
@@ -43,17 +44,53 @@ bool checked_element_count(const std::vector<int32_t>& dims, size_t& count)
 }
 }  // namespace
 
+void Qwen3Layers::to_cuda(const std::shared_ptr<CudaConfig>& config)
+{
+    auto move_layer = [&config](const std::shared_ptr<Layer>& layer, bool move_weights = true) {
+        if (!layer) return;
+        layer->set_cuda_config(config);
+        if (move_weights) layer->to_cuda();
+    };
+
+    move_layer(add_layer_);
+    move_layer(swiglu_layer_);
+    move_layer(cls_layer_, !tied_weights_);
+    move_layer(embedding_layer_);
+
+    // lm_head.weight is tied to embed_tokens.weight. Reuse its CUDA buffer so
+    // the large vocabulary matrix is uploaded only once.
+    if (tied_weights_ && cls_layer_ && embedding_layer_)
+    {
+        auto cls = std::dynamic_pointer_cast<LayerParam>(cls_layer_);
+        auto embedding = std::dynamic_pointer_cast<LayerParam>(embedding_layer_);
+        CHECK(cls != nullptr && embedding != nullptr);
+        CHECK(cls->set_weight(0, embedding->get_weight(0)));
+        cls_layer_->set_cuda_config(config);
+    }
+
+    move_layer(mha_layer_);
+    for (auto* layers : {&wq_layers_, &wk_layers_, &wv_layers_, &wo_layers_,
+                         &w1_layers_, &w2_layers_, &w3_layers_, &rmsnorm_layers_,
+                         &qnorm_layers_, &knorm_layers_})
+    {
+        for (const auto& layer : *layers) move_layer(layer);
+    }
+}
+
 Qwen3Model::Qwen3Model(std::string tokenizer_path, std::string model_path,
                        int32_t max_seq_len)
-    : LLama2Model(TokenizerType::kEncodeBpe, std::move(tokenizer_path),
-                  std::move(model_path), false),
+    : Model(TokenizerType::kEncodeBpe, ModelType::kModelTypeQwen3,
+            std::move(tokenizer_path), std::move(model_path), false),
       requested_seq_len_(max_seq_len)
 {
-    model_type_ = ModelType::kModelTypeQwen3;
 }
 
 Qwen3Model::~Qwen3Model()
 {
+    if (cuda_config_ && cuda_config_->stream)
+    {
+        cudaStreamSynchronize(cuda_config_->stream);
+    }
     release_safetensors_map();
 }
 
@@ -322,7 +359,7 @@ float* Qwen3Model::load_weight(const std::string& name,
 
 void Qwen3Model::create_param_layers()
 {
-    CHECK(llama_layers_ != nullptr);
+    CHECK(qwen3_layers_ != nullptr);
     weight_loading_error_.clear();
     const int32_t dim = config_->dim_;
     const int32_t query_dim = config_->query_dim_;
@@ -335,7 +372,7 @@ void Qwen3Model::create_param_layers()
     if (!embedding_weight) return;
     auto embedding = std::make_shared<EmbeddingLayer>(device_type_, dim, config_->seq_len_, vocab_size);
     CHECK(embedding->set_weight(0, {vocab_size, dim}, embedding_weight, cpu));
-    llama_layers_->embedding_layer_ = embedding;
+    qwen3_layers_->embedding_layer_ = embedding;
 
     auto create_matmul = [this, cpu](const std::string& name, int32_t output_dim,
                                      int32_t input_dim) -> std::shared_ptr<Layer> {
@@ -378,43 +415,49 @@ void Qwen3Model::create_param_layers()
         }
         attention_norms.push_back(input_norm);
         ffn_norms.push_back(post_attention_norm);
-        llama_layers_->qnorm_layers_.push_back(q_norm);
-        llama_layers_->knorm_layers_.push_back(k_norm);
-        llama_layers_->wq_layers_.push_back(q);
-        llama_layers_->wk_layers_.push_back(k);
-        llama_layers_->wv_layers_.push_back(v);
-        llama_layers_->wo_layers_.push_back(o);
-        llama_layers_->w1_layers_.push_back(gate);
-        llama_layers_->w3_layers_.push_back(up);
-        llama_layers_->w2_layers_.push_back(down);
+        qwen3_layers_->qnorm_layers_.push_back(q_norm);
+        qwen3_layers_->knorm_layers_.push_back(k_norm);
+        qwen3_layers_->wq_layers_.push_back(q);
+        qwen3_layers_->wk_layers_.push_back(k);
+        qwen3_layers_->wv_layers_.push_back(v);
+        qwen3_layers_->wo_layers_.push_back(o);
+        qwen3_layers_->w1_layers_.push_back(gate);
+        qwen3_layers_->w3_layers_.push_back(up);
+        qwen3_layers_->w2_layers_.push_back(down);
     }
 
-    llama_layers_->rmsnorm_layers_.insert(llama_layers_->rmsnorm_layers_.end(),
+    qwen3_layers_->rmsnorm_layers_.insert(qwen3_layers_->rmsnorm_layers_.end(),
                                           attention_norms.begin(), attention_norms.end());
-    llama_layers_->rmsnorm_layers_.insert(llama_layers_->rmsnorm_layers_.end(),
+    qwen3_layers_->rmsnorm_layers_.insert(qwen3_layers_->rmsnorm_layers_.end(),
                                           ffn_norms.begin(), ffn_norms.end());
     auto final_norm = create_norm("model.norm.weight", dim);
     if (!final_norm) return;
-    llama_layers_->rmsnorm_layers_.push_back(final_norm);
+    qwen3_layers_->rmsnorm_layers_.push_back(final_norm);
 
     auto lm_head = std::make_shared<MatmulLayer>(device_type_, vocab_size, dim);
     CHECK(lm_head->set_weight(0, {vocab_size, dim}, embedding_weight, cpu));
-    llama_layers_->cls_layer_ = lm_head;
-    llama_layers_->tied_weights_ = true;
+    qwen3_layers_->cls_layer_ = lm_head;
+    qwen3_layers_->tied_weights_ = true;
 }
 
 void Qwen3Model::create_nonparam_layers()
 {
-    llama_layers_->mha_layer_ = std::make_shared<MultiHeadAttention>(
+    qwen3_layers_->mha_layer_ = std::make_shared<MultiHeadAttention>(
         device_type_, 0, config_->kv_mul_, config_->kv_dim_, config_->seq_len_,
         config_->head_num_, config_->head_size_);
-    llama_layers_->add_layer_ = std::make_shared<VecAddLayer>(device_type_);
-    llama_layers_->swiglu_layer_ = std::make_shared<SwiGLULayer>(device_type_, config_->hidden_dim_);
+    qwen3_layers_->add_layer_ = std::make_shared<VecAddLayer>(device_type_);
+    qwen3_layers_->swiglu_layer_ = std::make_shared<SwiGLULayer>(device_type_, config_->hidden_dim_);
+}
+
+void Qwen3Model::create_param_quant_layers()
+{
+    // Qwen3 checkpoints are loaded from Safetensors and converted to FP32
+    // staging tensors. The legacy packed-int8 model format is not applicable.
 }
 
 Status Qwen3Model::create_layers()
 {
-    llama_layers_ = std::make_unique<LLama2Layers>();
+    qwen3_layers_ = std::make_unique<Qwen3Layers>();
     create_param_layers();
     if (!weight_loading_error_.empty())
     {
@@ -423,17 +466,17 @@ Status Qwen3Model::create_layers()
     }
     create_nonparam_layers();
     const size_t layer_count = static_cast<size_t>(config_->layer_num_);
-    if (!llama_layers_->embedding_layer_ || !llama_layers_->cls_layer_ ||
-        llama_layers_->wq_layers_.size() != layer_count ||
-        llama_layers_->wk_layers_.size() != layer_count ||
-        llama_layers_->wv_layers_.size() != layer_count ||
-        llama_layers_->wo_layers_.size() != layer_count ||
-        llama_layers_->w1_layers_.size() != layer_count ||
-        llama_layers_->w2_layers_.size() != layer_count ||
-        llama_layers_->w3_layers_.size() != layer_count ||
-        llama_layers_->rmsnorm_layers_.size() != layer_count * 2 + 1 ||
-        llama_layers_->qnorm_layers_.size() != layer_count ||
-        llama_layers_->knorm_layers_.size() != layer_count)
+    if (!qwen3_layers_->embedding_layer_ || !qwen3_layers_->cls_layer_ ||
+        qwen3_layers_->wq_layers_.size() != layer_count ||
+        qwen3_layers_->wk_layers_.size() != layer_count ||
+        qwen3_layers_->wv_layers_.size() != layer_count ||
+        qwen3_layers_->wo_layers_.size() != layer_count ||
+        qwen3_layers_->w1_layers_.size() != layer_count ||
+        qwen3_layers_->w2_layers_.size() != layer_count ||
+        qwen3_layers_->w3_layers_.size() != layer_count ||
+        qwen3_layers_->rmsnorm_layers_.size() != layer_count * 2 + 1 ||
+        qwen3_layers_->qnorm_layers_.size() != layer_count ||
+        qwen3_layers_->knorm_layers_.size() != layer_count)
     {
         release_safetensors_map();
         return InternalError("Failed to construct all Qwen3 transformer layers.");
@@ -444,7 +487,194 @@ Status Qwen3Model::create_layers()
 
 void Qwen3Model::init_mem()
 {
-    LLama2Model::init_mem();
+    std::shared_ptr<DeviceAllocator> alloc;
+    if (device_type_ == DeviceType::kDeviceCPU)
+    {
+        alloc = CPUDeviceAllocatorFactory::get_instance();
+    }
+    else
+    {
+        alloc = CUDADeviceAllocatorFactory::get_instance();
+        CHECK(cuda_config_ != nullptr);
+        qwen3_layers_->to_cuda(cuda_config_);
+    }
+
+    const auto alloc_cpu = CPUDeviceAllocatorFactory::get_instance();
+    Tensor input_tokens(DataType::kDataTypeInt32, 1, true, alloc_cpu);
+    Tensor input_embeddings(DataType::kDataTypeFp32, 1, config_->dim_, true, alloc);
+    Tensor sin_cache(DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_, true, alloc);
+    Tensor cos_cache(DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kSinCache, sin_cache));
+    CHECK(insert_buffer(ModelBufferType::kCosCache, cos_cache));
+    CHECK(insert_buffer(ModelBufferType::kInputTokens, input_tokens));
+    CHECK(insert_buffer(ModelBufferType::kInputEmbeddings, input_embeddings));
+
+    Tensor rms_output(DataType::kDataTypeFp32, config_->dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
+    CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
+    CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
+    Tensor mha_output(DataType::kDataTypeFp32, config_->query_dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kOutputMHA, mha_output));
+
+    Tensor w1_output(DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
+    Tensor w3_output(DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
+    CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
+
+    Tensor key_cache(DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
+                     config_->kv_dim_, true, alloc);
+    Tensor value_cache(DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
+                       config_->kv_dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
+    CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+
+    Tensor query(DataType::kDataTypeFp32, config_->query_dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kQuery, query));
+    Tensor pos_tensor(DataType::kDataTypeInt32, 1, true, alloc_cpu);
+    CHECK(insert_buffer(ModelBufferType::kInputPos, pos_tensor));
+
+    Tensor scores(DataType::kDataTypeFp32, config_->head_num_, config_->seq_len_, true, alloc);
+    Tensor attention_output(DataType::kDataTypeFp32, config_->dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kScoreStorage, scores));
+    CHECK(insert_buffer(ModelBufferType::kAttnOutput, attention_output));
+
+    Tensor forward_output(DataType::kDataTypeFp32, config_->vocab_size_, true, alloc);
+    if (device_type_ == DeviceType::kDeviceCUDA)
+    {
+        Tensor forward_output_cpu(DataType::kDataTypeFp32, config_->vocab_size_, true, alloc_cpu);
+        CHECK(insert_buffer(ModelBufferType::kForwardOutputCPU, forward_output_cpu));
+    }
+    CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
+}
+
+std::pair<Tensor, Tensor> Qwen3Model::slice_kv_cache(int32_t layer_idx,
+                                                      int32_t token_pos) const
+{
+    const int64_t layer_offset = static_cast<int64_t>(layer_idx) * config_->seq_len_ * config_->kv_dim_;
+    const int64_t cache_offset = layer_offset + static_cast<int64_t>(token_pos) * config_->kv_dim_;
+    float* key_ptr = const_cast<float*>(get_buffer(ModelBufferType::kKeyCache).ptr<float>(cache_offset));
+    float* value_ptr = const_cast<float*>(get_buffer(ModelBufferType::kValueCache).ptr<float>(cache_offset));
+
+    auto key_buffer = std::make_shared<Buffer>(config_->kv_dim_ * sizeof(float), nullptr, key_ptr, true);
+    auto value_buffer = std::make_shared<Buffer>(config_->kv_dim_ * sizeof(float), nullptr, value_ptr, true);
+    key_buffer->set_device_type(device_type_);
+    value_buffer->set_device_type(device_type_);
+    Tensor key(DataType::kDataTypeFp32, config_->kv_dim_);
+    Tensor value(DataType::kDataTypeFp32, config_->kv_dim_);
+    CHECK(key.assign(key_buffer));
+    CHECK(value.assign(value_buffer));
+    return {key, value};
+}
+
+Status Qwen3Model::embedding(const std::vector<int32_t>& tokens,
+                             EmbeddingOutput& output) const
+{
+    if (tokens.empty() || tokens.size() > static_cast<size_t>(config_->seq_len_))
+    {
+        return InvalidArgument("The Qwen3 embedding token count is outside the context window.");
+    }
+    Tensor input_tokens = get_buffer(ModelBufferType::kInputTokens);
+    Tensor input_embeddings = get_buffer(ModelBufferType::kInputEmbeddings);
+    if (input_tokens.size() != tokens.size())
+    {
+        input_tokens.reshape({static_cast<int32_t>(tokens.size())});
+        input_embeddings.reshape({static_cast<int32_t>(tokens.size()), config_->dim_});
+    }
+    for (size_t i = 0; i < tokens.size(); ++i)
+    {
+        input_tokens.index<int32_t>(static_cast<int64_t>(i)) = tokens[i];
+    }
+
+    Tensor token_count(DataType::kDataTypeInt32, static_cast<int32_t>(tokens.size()));
+    const Status status = qwen3_layers_->embedding_layer_->forward(input_tokens, token_count,
+                                                                   input_embeddings);
+    if (!status) return status;
+    output = EmbeddingOutput(input_tokens, input_embeddings, token_count);
+    return Success();
+}
+
+Tensor Qwen3Model::fill_input(const Tensor& pos_tensor,
+                              const EmbeddingOutput& embedding_output,
+                              bool is_prompt) const
+{
+    const int32_t index = is_prompt ? pos_tensor.index<int32_t>(0) : 0;
+    const Tensor& embeddings = embedding_output.input_embeddings;
+    CHECK_GE(index, 0);
+    CHECK_LT(index, embeddings.get_dim(0));
+    auto input_buffer = std::make_shared<Buffer>(config_->dim_ * sizeof(float), nullptr,
+                                                 const_cast<float*>(embeddings.ptr<float>(static_cast<int64_t>(index) * config_->dim_)), true);
+    input_buffer->set_device_type(device_type_);
+    Tensor input(DataType::kDataTypeFp32, config_->dim_);
+    CHECK(input.assign(input_buffer));
+    return input;
+}
+
+Status Qwen3Model::attention_rms(int32_t layer_idx, const Tensor& input) const
+{
+    const Tensor output = get_buffer(ModelBufferType::kOutputRMSNorm);
+    return qwen3_layers_->rmsnorm_layers_.at(layer_idx)->forward(input, output);
+}
+
+Status Qwen3Model::attention_mha(int32_t layer_idx, const Tensor& pos_tensor) const
+{
+    Tensor query = get_buffer(ModelBufferType::kQuery);
+    Tensor scores = get_buffer(ModelBufferType::kScoreStorage);
+    Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
+    Tensor value_cache = get_buffer(ModelBufferType::kValueCache);
+    Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
+    auto mha = std::dynamic_pointer_cast<MultiHeadAttention>(qwen3_layers_->mha_layer_);
+    if (!mha) return InternalError("The Qwen3 multi-head attention layer is missing.");
+    const int32_t pos = pos_tensor.index<int32_t>(0);
+    mha->set_pos(pos);
+    mha->set_layer_idx(layer_idx);
+    Status status = qwen3_layers_->mha_layer_->forward(query, scores, key_cache, value_cache,
+                                                       mha_output);
+    if (!status) return status;
+    return qwen3_layers_->wo_layers_.at(layer_idx)->forward(
+        mha_output, get_buffer(ModelBufferType::kAttnOutput));
+}
+
+Status Qwen3Model::feed_forward(int32_t layer_idx, const Tensor& input) const
+{
+    Status status = qwen3_layers_->add_layer_->forward(
+        input, get_buffer(ModelBufferType::kAttnOutput), input);
+    if (!status) return status;
+
+    Tensor ffn_norm = get_buffer(ModelBufferType::kFFNRMSNorm);
+    status = qwen3_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_)->forward(input,
+                                                                                         ffn_norm);
+    if (!status) return status;
+
+    Tensor gate = get_buffer(ModelBufferType::kW1Output);
+    Tensor up = get_buffer(ModelBufferType::kW3Output);
+    status = qwen3_layers_->w1_layers_.at(layer_idx)->forward(ffn_norm, gate);
+    if (!status) return status;
+    status = qwen3_layers_->w3_layers_.at(layer_idx)->forward(ffn_norm, up);
+    if (!status) return status;
+    status = qwen3_layers_->swiglu_layer_->forward(gate, up, gate);
+    if (!status) return status;
+
+    Tensor down = get_buffer(ModelBufferType::kW2Output);
+    status = qwen3_layers_->w2_layers_.at(layer_idx)->forward(gate, down);
+    if (!status) return status;
+    return qwen3_layers_->add_layer_->forward(input, down, input);
+}
+
+Status Qwen3Model::cls_logits(const Tensor& input) const
+{
+    const auto& final_norm = qwen3_layers_->rmsnorm_layers_.at(2 * config_->layer_num_);
+    Status status = final_norm->forward(input, input);
+    if (!status) return status;
+    return qwen3_layers_->cls_layer_->forward(input, get_buffer(ModelBufferType::kForwardOutput));
+}
+
+Status Qwen3Model::predict(const Tensor& input, const Tensor& pos_tensor,
+                           bool is_prompt, int& next) const
+{
+    Status status = forward(input, pos_tensor, next);
+    if (!status) return status;
+    next = post_processing(pos_tensor, is_prompt);
+    return Success();
 }
 
 Status Qwen3Model::forward(const Tensor& input, const Tensor& pos_tensor, int& next) const
@@ -468,13 +698,17 @@ Status Qwen3Model::forward(const Tensor& input, const Tensor& pos_tensor, int& n
 
     for (int32_t layer = 0; layer < config_->layer_num_; ++layer)
     {
-        attention_rms(layer, input);
+        Status status = attention_rms(layer, input);
+        if (!status) return status;
         Tensor query = get_buffer(ModelBufferType::kQuery);
         const auto [key, value] = slice_kv_cache(layer, pos);
         const Tensor normalized = get_buffer(ModelBufferType::kOutputRMSNorm);
-        STATUS_CHECK(llama_layers_->wq_layers_.at(layer)->forward(normalized, query));
-        STATUS_CHECK(llama_layers_->wk_layers_.at(layer)->forward(normalized, key));
-        STATUS_CHECK(llama_layers_->wv_layers_.at(layer)->forward(normalized, value));
+        status = qwen3_layers_->wq_layers_.at(layer)->forward(normalized, query);
+        if (!status) return status;
+        status = qwen3_layers_->wk_layers_.at(layer)->forward(normalized, key);
+        if (!status) return status;
+        status = qwen3_layers_->wv_layers_.at(layer)->forward(normalized, value);
+        if (!status) return status;
 
         Tensor query_heads(DataType::kDataTypeFp32, config_->head_num_, config_->head_size_,
                            false, nullptr, query.ptr<float>());
@@ -482,8 +716,10 @@ Status Qwen3Model::forward(const Tensor& input, const Tensor& pos_tensor, int& n
                          false, nullptr, const_cast<float*>(key.ptr<float>()));
         query_heads.set_device_type(device_type_);
         key_heads.set_device_type(device_type_);
-        STATUS_CHECK(llama_layers_->qnorm_layers_.at(layer)->forward(query_heads, query_heads));
-        STATUS_CHECK(llama_layers_->knorm_layers_.at(layer)->forward(key_heads, key_heads));
+        status = qwen3_layers_->qnorm_layers_.at(layer)->forward(query_heads, query_heads);
+        if (!status) return status;
+        status = qwen3_layers_->knorm_layers_.at(layer)->forward(key_heads, key_heads);
+        if (!status) return status;
 
         if (device_type_ == DeviceType::kDeviceCPU)
         {
@@ -498,10 +734,96 @@ Status Qwen3Model::forward(const Tensor& input, const Tensor& pos_tensor, int& n
                                  get_buffer(ModelBufferType::kCosCache), cuda_config_->stream);
         }
 
-        attention_mha(layer, pos_tensor);
-        feed_forward(layer, input);
+        status = attention_mha(layer, pos_tensor);
+        if (!status) return status;
+        status = feed_forward(layer, input);
+        if (!status) return status;
     }
-    cls_logits(input);
+    return cls_logits(input);
+}
+
+std::vector<int32_t> Qwen3Model::encode(const std::string& sentence) const
+{
+    CHECK(encode_layer_ != nullptr);
+    return encode_layer_->encode(sentence);
+}
+
+bool Qwen3Model::is_sentence_ending(int32_t token_idx) const
+{
+    CHECK(encode_layer_ != nullptr);
+    return encode_layer_->is_sentence_ending(token_idx);
+}
+
+std::string Qwen3Model::decode(int32_t token_idx) const
+{
+    CHECK(encode_layer_ != nullptr);
+    return encode_layer_->decode(token_idx);
+}
+
+std::string Qwen3Model::decode(std::vector<int32_t> token_idxs) const
+{
+    CHECK(encode_layer_ != nullptr);
+    return encode_layer_->decode(token_idxs);
+}
+
+Status Qwen3Model::generate(const std::string& prompt, int32_t max_new_tokens,
+                            std::string& output)
+{
+    output.clear();
+    if (!config_ || !encode_layer_ || !sampler_)
+    {
+        return InternalError("The Qwen3 model must be initialized before generation.");
+    }
+    if (max_new_tokens < 0)
+    {
+        return InvalidArgument("The number of generated tokens cannot be negative.");
+    }
+    if (max_new_tokens == 0) return Success();
+
+    const std::vector<int32_t> token_ids = encode(prompt);
+    if (token_ids.empty()) return InvalidArgument("The prompt did not produce any Qwen3 tokens.");
+    if (token_ids.size() > static_cast<size_t>(config_->seq_len_))
+    {
+        return InvalidArgument("The prompt is longer than the Qwen3 context window.");
+    }
+    const int32_t max_context_tokens = config_->seq_len_ - static_cast<int32_t>(token_ids.size()) + 1;
+    if (max_new_tokens > max_context_tokens)
+    {
+        return InvalidArgument("The requested generation length exceeds the Qwen3 context window.");
+    }
+
+    EmbeddingOutput prompt_embedding(Tensor{}, Tensor{}, Tensor{});
+    Status status = embedding(token_ids, prompt_embedding);
+    if (!status) return status;
+    Tensor& pos_tensor = get_buffer(ModelBufferType::kInputPos);
+    int next = -1;
+    for (size_t i = 0; i < token_ids.size(); ++i)
+    {
+        pos_tensor.index<int32_t>(0) = static_cast<int32_t>(i);
+        const Tensor input = fill_input(pos_tensor, prompt_embedding, true);
+        const bool skip_sampling = i + 1 < token_ids.size();
+        status = predict(input, pos_tensor, skip_sampling, next);
+        if (!status) return status;
+    }
+
+    std::vector<int32_t> generated_tokens;
+    generated_tokens.reserve(max_new_tokens);
+    for (int32_t i = 0; i < max_new_tokens; ++i)
+    {
+        if (next < 0) return InternalError("Qwen3 did not produce a token after the prompt.");
+        if (is_sentence_ending(next)) break;
+        generated_tokens.push_back(next);
+        if (i + 1 == max_new_tokens) break;
+
+        EmbeddingOutput next_embedding(Tensor{}, Tensor{}, Tensor{});
+        status = embedding({next}, next_embedding);
+        if (!status) return status;
+        pos_tensor.index<int32_t>(0) = static_cast<int32_t>(token_ids.size()) + i;
+        const Tensor input = fill_input(pos_tensor, next_embedding, false);
+        status = predict(input, pos_tensor, false, next);
+        if (!status) return status;
+    }
+    output = decode(generated_tokens);
     return Success();
 }
 
