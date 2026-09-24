@@ -37,7 +37,7 @@ namespace my_vllm
             swiglu_layer_->to_cuda();
         }
 
-        if (cls_layer_)
+        if (cls_layer_ && !tied_weights_)
         {
             cls_layer_->set_cuda_config(config);
             cls_layer_->to_cuda();
@@ -47,6 +47,17 @@ namespace my_vllm
         {
             embedding_layer_->set_cuda_config(config);
             embedding_layer_->to_cuda();
+        }
+
+        // Qwen3 ties lm_head.weight to embed_tokens.weight. Reuse the CUDA
+        // embedding allocation instead of copying the 600 MB matrix twice.
+        if (tied_weights_ && cls_layer_ && embedding_layer_)
+        {
+            auto cls = std::dynamic_pointer_cast<LayerParam>(cls_layer_);
+            auto embedding = std::dynamic_pointer_cast<LayerParam>(embedding_layer_);
+            CHECK(cls != nullptr && embedding != nullptr);
+            CHECK(cls->set_weight(0, embedding->get_weight(0)));
+            cls_layer_->set_cuda_config(config);
         }
 
         if (mha_layer_)
@@ -124,6 +135,23 @@ namespace my_vllm
             {
                 rms_norm_layer->set_cuda_config(config);
                 rms_norm_layer->to_cuda();
+            }
+        }
+
+        for (auto &norm_layer : qnorm_layers_)
+        {
+            if (norm_layer)
+            {
+                norm_layer->set_cuda_config(config);
+                norm_layer->to_cuda();
+            }
+        }
+        for (auto &norm_layer : knorm_layers_)
+        {
+            if (norm_layer)
+            {
+                norm_layer->set_cuda_config(config);
+                norm_layer->to_cuda();
             }
         }
     }
@@ -656,9 +684,11 @@ namespace my_vllm
 
         Tensor rms_output(DataType::kDataTypeFp32, config_->dim_, true, alloc);
         CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
-        CHECK(insert_buffer(ModelBufferType::kOutputMHA, rms_output));
         CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
         CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
+        Tensor mha_output(DataType::kDataTypeFp32,
+                          config_->query_dim_ > 0 ? config_->query_dim_ : config_->dim_, true, alloc);
+        CHECK(insert_buffer(ModelBufferType::kOutputMHA, mha_output));
 
         Tensor w1_output(DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
         Tensor w3_output(DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
@@ -676,7 +706,8 @@ namespace my_vllm
         CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
 
         // Wq query output
-        Tensor query(DataType::kDataTypeFp32, config_->dim_, true, alloc);
+        const int32_t query_dim = config_->query_dim_ > 0 ? config_->query_dim_ : config_->dim_;
+        Tensor query(DataType::kDataTypeFp32, query_dim, true, alloc);
         CHECK(insert_buffer(ModelBufferType::kQuery, query));
 
         // Pos tensor
@@ -685,8 +716,9 @@ namespace my_vllm
 
         // Attention output
         Tensor attn(DataType::kDataTypeFp32, config_->head_num_, config_->seq_len_, true, alloc);
+        Tensor attn_output(DataType::kDataTypeFp32, config_->dim_, true, alloc);
         CHECK(insert_buffer(ModelBufferType::kScoreStorage, attn));
-        CHECK(insert_buffer(ModelBufferType::kAttnOutput, query));
+        CHECK(insert_buffer(ModelBufferType::kAttnOutput, attn_output));
 
         // final forward output
         Tensor forward_output(DataType::kDataTypeFp32, config_->vocab_size_, true, alloc);

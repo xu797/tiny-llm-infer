@@ -482,6 +482,128 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string &
     return bpe_offsets;
 }
 
+// Qwen3 uses the GPT-2/Roberta-style pattern with individual number tokens.
+// Keep this small Unicode-aware matcher here instead of relying on std::regex,
+// which does not implement the \p{L}/\p{N} classes used by tokenizer.json.
+static std::vector<size_t> unicode_regex_split_custom_qwen3(const std::string & text,
+                                                            const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+    std::vector<size_t> pieces;
+    pieces.reserve(cpts.size());
+    size_t region_start = 0;
+    for (const size_t region_size : offsets) {
+        const size_t region_end = region_start + region_size;
+        size_t pos = region_start;
+        auto in_region = [region_end](size_t p) { return p < region_end; };
+        auto flags_at = [&cpts, &in_region](size_t p) {
+            return in_region(p) ? unicode_cpt_flags(cpts[p]) : codepoint_flags{};
+        };
+        auto codepoint_at = [&cpts, &in_region](size_t p) {
+            return in_region(p) ? cpts[p] : 0xFFFFFFFFu;
+        };
+        auto add_piece = [&pieces](size_t count) {
+            if (count > 0) pieces.push_back(count);
+        };
+
+        while (pos < region_end) {
+            const size_t begin = pos;
+            const uint32_t cp = codepoint_at(pos);
+            const codepoint_flags flags = flags_at(pos);
+
+            // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+            if (cp == '\'' && in_region(pos + 1)) {
+                const uint32_t suffix1 = unicode_tolower(codepoint_at(pos + 1));
+                if (suffix1 == 's' || suffix1 == 't' || suffix1 == 'm' || suffix1 == 'd') {
+                    pos += 2;
+                    add_piece(pos - begin);
+                    continue;
+                }
+                if (in_region(pos + 2)) {
+                    const uint32_t suffix2 = unicode_tolower(codepoint_at(pos + 2));
+                    if ((suffix1 == 'r' && suffix2 == 'e') ||
+                        (suffix1 == 'v' && suffix2 == 'e') ||
+                        (suffix1 == 'l' && suffix2 == 'l')) {
+                        pos += 3;
+                        add_piece(pos - begin);
+                        continue;
+                    }
+                }
+            }
+
+            // [^\r\n\p{L}\p{N}]?\p{L}+
+            size_t letters_start = pos;
+            if (!(cp == '\r' || cp == '\n' || flags.is_letter || flags.is_number) &&
+                flags_at(pos + 1).is_letter) {
+                ++letters_start;
+            }
+            if (flags_at(letters_start).is_letter) {
+                pos = letters_start;
+                while (in_region(pos) && flags_at(pos).is_letter) ++pos;
+                add_piece(pos - begin);
+                continue;
+            }
+
+            // \p{N} (intentionally one digit/codepoint per piece in Qwen3).
+            if (flags.is_number) {
+                ++pos;
+                add_piece(1);
+                continue;
+            }
+
+            //  ?[^\s\p{L}\p{N}]+[\r\n]*
+            size_t punctuation_start = pos;
+            if (cp == ' ' && !(flags_at(pos + 1).is_whitespace ||
+                               flags_at(pos + 1).is_letter || flags_at(pos + 1).is_number)) {
+                ++punctuation_start;
+            }
+            auto is_punctuation = [&flags_at](size_t p) {
+                const auto f = flags_at(p);
+                return !f.is_whitespace && !f.is_letter && !f.is_number && f.as_uint() != 0;
+            };
+            if (is_punctuation(punctuation_start)) {
+                pos = punctuation_start;
+                while (in_region(pos) && is_punctuation(pos)) ++pos;
+                while (codepoint_at(pos) == '\r' || codepoint_at(pos) == '\n') ++pos;
+                add_piece(pos - begin);
+                continue;
+            }
+
+            // \s*[\r\n]+, followed by the whitespace alternatives.
+            if (flags.is_whitespace) {
+                size_t newline = pos;
+                while (in_region(newline) && flags_at(newline).is_whitespace &&
+                       codepoint_at(newline) != '\r' && codepoint_at(newline) != '\n') {
+                    ++newline;
+                }
+                if (codepoint_at(newline) == '\r' || codepoint_at(newline) == '\n') {
+                    pos = newline;
+                    while (codepoint_at(pos) == '\r' || codepoint_at(pos) == '\n') ++pos;
+                } else {
+                    size_t whitespace_end = begin;
+                    while (in_region(whitespace_end) && flags_at(whitespace_end).is_whitespace) {
+                        ++whitespace_end;
+                    }
+                    const size_t whitespace_count = whitespace_end - begin;
+                    // Match the greedy \s+(?!\S) alternative first: when a
+                    // non-whitespace follows, it backs off by one codepoint,
+                    // and the final \s+ alternative consumes that last one.
+                    pos = whitespace_count > 1 && whitespace_end < region_end
+                              ? whitespace_end - 1
+                              : whitespace_end;
+                }
+                if (pos == begin) ++pos;
+                add_piece(pos - begin);
+                continue;
+            }
+
+            ++pos;
+            add_piece(1);
+        }
+        region_start = region_end;
+    }
+    return pieces;
+}
+
 // use std::wregex to split the text
 static std::vector<size_t> unicode_regex_split_stl(const std::wstring & wtext, const std::wstring & regex_expr, const std::vector<size_t> & offsets) {
     std::wregex expr(regex_expr);
@@ -547,6 +669,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
 
     if (regex_expr == "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)") {
         bpe_offsets = unicode_regex_split_custom_gpt2(text, offsets);
+    } else if (regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_qwen3(text, offsets);
     } else if (
             regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
             regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {

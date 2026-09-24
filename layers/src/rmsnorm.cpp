@@ -7,8 +7,8 @@
 
 namespace my_vllm
 {
-RmsNormLayer::RmsNormLayer(DeviceType device_type, int32_t dim)
-    : LayerParam(device_type, LayerType::kLayerRMSNorm, false, "RMSNorm"), dim_(dim)
+RmsNormLayer::RmsNormLayer(DeviceType device_type, int32_t dim, float eps)
+    : LayerParam(device_type, LayerType::kLayerRMSNorm, false, "RMSNorm"), dim_(dim), eps_(eps)
 {
     reset_input_size(1);
     reset_output_size(1);
@@ -29,7 +29,8 @@ Status RmsNormLayer::forward()
     {
         CHECK(cuda_config_ != nullptr);
     }
-    get_rmsnorm_kernel(device_type_)(input, weight, output, cuda_config_ ? cuda_config_->stream : nullptr);
+    get_rmsnorm_kernel(device_type_)(input, weight, output,
+                                     cuda_config_ ? cuda_config_->stream : nullptr, eps_);
     return Success();
 }
 

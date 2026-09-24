@@ -36,7 +36,7 @@ typedef void (*MHAKernel)(int32_t pos, int32_t head_num, int32_t layer_index, in
                           CudaConfig*);
 
 typedef void (*RMSNormKernel)(const Tensor& input, const Tensor& weight,
-                              const Tensor& output, void* stream);
+                              const Tensor& output, void* stream, float eps);
 
 typedef void (*RoPEKernel)(int32_t dim, int32_t kv_dim, int32_t head_size,
                            const Tensor& input_q, const Tensor& input_k,

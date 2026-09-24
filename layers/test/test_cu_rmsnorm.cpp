@@ -36,11 +36,11 @@ TEST(test_rmsnorm_cu, rmsnorm_nostream)
   out_cu.to_cuda(nullptr);
 
   get_rmsnorm_kernel(DeviceType::kDeviceCUDA)(in_cu, wei_cu, out_cu,
-                                                            nullptr);
+                                                            nullptr, 1e-5f);
   out_cu.to_cpu();
 
   get_rmsnorm_kernel(DeviceType::kDeviceCPU)(in_cpu, wei_cpu, out_cpu,
-                                                           nullptr);
+                                                           nullptr, 1e-5f);
 
   for (int i = 0; i < size; ++i)
   {
@@ -77,11 +77,11 @@ TEST(test_rmsnorm_cu, rmsnorm_stream)
   cudaStream_t stream;
   cudaStreamCreate(&stream);
   get_rmsnorm_kernel(DeviceType::kDeviceCUDA)(in_cu, wei_cu, out_cu,
-                                                            stream);
+                                                            stream, 1e-5f);
   out_cu.to_cpu();
 
   get_rmsnorm_kernel(DeviceType::kDeviceCPU)(in_cpu, wei_cpu, out_cpu,
-                                                           nullptr);
+                                                           nullptr, 1e-5f);
 
   for (int i = 0; i < size; ++i)
   {
@@ -119,11 +119,11 @@ TEST(test_rmsnorm_cu, rmsnorm_stream2)
   cudaStream_t stream;
   cudaStreamCreate(&stream);
   get_rmsnorm_kernel(DeviceType::kDeviceCUDA)(in_cu, wei_cu, out_cu,
-                                                            stream);
+                                                            stream, 1e-5f);
   out_cu.to_cpu();
 
   get_rmsnorm_kernel(DeviceType::kDeviceCPU)(in_cpu, wei_cpu, out_cpu,
-                                                           nullptr);
+                                                           nullptr, 1e-5f);
 
   for (int i = 0; i < size; ++i)
   {
