@@ -181,4 +181,73 @@ void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const Tensor
                                                     cos_cache.ptr<float>());
     }
     }
-}  
+
+__global__ void qwen3_sin_cos_calc(int32_t head_size, int32_t max_seq_len, float rope_theta,
+                                   float* sin_cache, float* cos_cache)
+{
+    const int32_t i = threadIdx.x + blockDim.x * blockIdx.x;
+    if (i >= head_size / 2) return;
+    const float frequency = powf(rope_theta, -2.0f * static_cast<float>(i) / head_size);
+    for (int32_t pos = 0; pos < max_seq_len; ++pos)
+    {
+        const float angle = static_cast<float>(pos) * frequency;
+        sin_cache[pos * head_size + i] = sinf(angle);
+        cos_cache[pos * head_size + i] = cosf(angle);
+    }
+}
+
+__global__ void qwen3_rope_kernel(int32_t pos, int32_t query_heads, int32_t kv_heads,
+                                  int32_t head_size, float* query, float* key,
+                                  const float* sin_cache, const float* cos_cache)
+{
+    const int32_t half = head_size / 2;
+    const int32_t pair = threadIdx.x + blockDim.x * blockIdx.x;
+    const int32_t total_pairs = query_heads * half;
+    if (pair >= total_pairs) return;
+    const int32_t head = pair / half;
+    const int32_t i = pair % half;
+    const int32_t first = head * head_size + i;
+    const int32_t second = first + half;
+    const float sine = sin_cache[pos * head_size + i];
+    const float cosine = cos_cache[pos * head_size + i];
+
+    const float qx = query[first];
+    const float qy = query[second];
+    query[first] = qx * cosine - qy * sine;
+    query[second] = qx * sine + qy * cosine;
+    if (head < kv_heads)
+    {
+        const float kx = key[first];
+        const float ky = key[second];
+        key[first] = kx * cosine - ky * sine;
+        key[second] = kx * sine + ky * cosine;
+    }
+}
+
+void qwen3_sin_cos_cache_calc_cu(int32_t head_size, int32_t max_seq_len, float rope_theta,
+                                 const Tensor& sin_cache, const Tensor& cos_cache,
+                                 cudaStream_t stream)
+{
+    CHECK(!sin_cache.is_empty() && !cos_cache.is_empty());
+    const int32_t threads = 128;
+    const int32_t blocks = (head_size / 2 + threads - 1) / threads;
+    qwen3_sin_cos_calc<<<blocks, threads, 0, stream>>>(
+        head_size, max_seq_len, rope_theta, const_cast<float*>(sin_cache.ptr<float>()),
+        const_cast<float*>(cos_cache.ptr<float>()));
+}
+
+void qwen3_rope_kernel_cu(int32_t query_heads, int32_t kv_heads, int32_t head_size,
+                          const Tensor& input_q, const Tensor& input_k,
+                          const Tensor& input_pos, const Tensor& sin_cache,
+                          const Tensor& cos_cache, void* stream)
+{
+    const int32_t pos = input_pos.ptr<int32_t>()[0];
+    const int32_t total_pairs = query_heads * (head_size / 2);
+    const int32_t threads = 128;
+    const int32_t blocks = (total_pairs + threads - 1) / threads;
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    qwen3_rope_kernel<<<blocks, threads, 0, cuda_stream>>>(
+        pos, query_heads, kv_heads, head_size, const_cast<float*>(input_q.ptr<float>()),
+        const_cast<float*>(input_k.ptr<float>()), sin_cache.ptr<float>(), cos_cache.ptr<float>());
+}
+}

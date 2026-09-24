@@ -26,10 +26,13 @@ struct LLama2Layers
   std::vector<std::shared_ptr<Layer>> w1_layers_;
   std::vector<std::shared_ptr<Layer>> w2_layers_;
   std::vector<std::shared_ptr<Layer>> rmsnorm_layers_;
+  std::vector<std::shared_ptr<Layer>> qnorm_layers_;
+  std::vector<std::shared_ptr<Layer>> knorm_layers_;
   std::vector<std::shared_ptr<Layer>> w3_layers_;
   std::shared_ptr<Layer> cls_layer_;
 
   std::shared_ptr<Layer> embedding_layer_;
+  bool tied_weights_ = false;
 
   void to_cuda(std::shared_ptr<CudaConfig> config);
 };

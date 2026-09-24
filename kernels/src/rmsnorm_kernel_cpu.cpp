@@ -2,7 +2,8 @@
 
 namespace my_vllm
 {
-void rmsnorm_kernel_cpu(const Tensor& input, const Tensor& weight, const Tensor& output, void* stream) 
+void rmsnorm_kernel_cpu(const Tensor& input, const Tensor& weight, const Tensor& output,
+                        void* stream, float eps)
 {
     UNUSED(stream);
     CHECK(!input.is_empty());
@@ -21,12 +22,6 @@ void rmsnorm_kernel_cpu(const Tensor& input, const Tensor& weight, const Tensor&
     CHECK_EQ(input.size() % dim, 0);
     CHECK_EQ(output.size(), input.size());
     const int32_t row_num = static_cast<int32_t>(input.size() / dim);
-
-    #ifdef QWEN2_SUPPORT
-        const float eps = 1e-6f;
-    #else
-        const float eps = 1e-5f;
-    #endif
 
     for (int32_t row = 0; row < row_num; ++row)
     {

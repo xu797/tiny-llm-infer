@@ -36,7 +36,8 @@ static __global__ void row_rmsnorm_f32(const float* in, const float* wei, float*
     }
 }
 
-void rmsnorm_kernel_cu(const Tensor& input, const Tensor& weight, const Tensor& output, void* stream) 
+void rmsnorm_kernel_cu(const Tensor& input, const Tensor& weight, const Tensor& output,
+                       void* stream, float eps)
 {
     CHECK(!input.is_empty());
     CHECK(!weight.is_empty());
@@ -46,11 +47,6 @@ void rmsnorm_kernel_cu(const Tensor& input, const Tensor& weight, const Tensor& 
         weight.device_type() == DeviceType::kDeviceCUDA &&
         output.device_type() == DeviceType::kDeviceCUDA);
 
-    #ifdef QWEN2_SUPPORT
-        const float eps = 1e-6f;
-    #else
-        const float eps = 1e-5f;
-    #endif
     const int32_t row_size = static_cast<int32_t>(weight.size());
     CHECK_GT(row_size, 0);
     CHECK_EQ(input.size() % row_size, 0);

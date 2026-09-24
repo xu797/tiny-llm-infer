@@ -4,14 +4,37 @@
 #include <string>
 
 #include "llama.h"
+#include "qwen3.h"
 
 namespace
 {
 void print_inference_usage(const char* program)
 {
     std::cerr << "Usage: " << program
-              << " --infer --tokenizer <tokenizer.model> --model <weights.bin>"
-                 " --prompt <text> [--device cpu|cuda] [--max-new-tokens <count>] [--quant]\n";
+              << " --infer --tokenizer <tokenizer-file> --model <weights-file>"
+                 " --prompt <text> [--model-type llama2|qwen3] [--device cpu|cuda]"
+                 " [--max-new-tokens <count>] [--max-seq-len <count>] [--quant]\n";
+}
+
+template <typename ModelT>
+int run_initialized_model(ModelT& model, my_vllm::DeviceType device_type,
+                          const std::string& prompt, int max_new_tokens)
+{
+    my_vllm::Status status = model.init(device_type);
+    if (!status)
+    {
+        std::cerr << "Model initialization failed: " << status.get_err_msg() << '\n';
+        return 1;
+    }
+    std::string generated;
+    status = model.generate(prompt, max_new_tokens, generated);
+    if (!status)
+    {
+        std::cerr << "Generation failed: " << status.get_err_msg() << '\n';
+        return 1;
+    }
+    std::cout << generated << std::endl;
+    return 0;
 }
 
 int run_inference(int argc, char* argv[])
@@ -20,7 +43,9 @@ int run_inference(int argc, char* argv[])
     std::string model_path;
     std::string prompt;
     std::string device = "cpu";
+    std::string model_type = "llama2";
     int max_new_tokens = 64;
+    int max_seq_len = 2048;
     bool quant = false;
 
     for (int i = 2; i < argc; ++i)
@@ -42,6 +67,10 @@ int run_inference(int argc, char* argv[])
         {
             device = argv[++i];
         }
+        else if (arg == "--model-type" && i + 1 < argc)
+        {
+            model_type = argv[++i];
+        }
         else if (arg == "--max-new-tokens" && i + 1 < argc)
         {
             try
@@ -51,6 +80,18 @@ int run_inference(int argc, char* argv[])
             catch (const std::exception&)
             {
                 std::cerr << "--max-new-tokens must be an integer.\n";
+                return 2;
+            }
+        }
+        else if (arg == "--max-seq-len" && i + 1 < argc)
+        {
+            try
+            {
+                max_seq_len = std::stoi(argv[++i]);
+            }
+            catch (const std::exception&)
+            {
+                std::cerr << "--max-seq-len must be an integer.\n";
                 return 2;
             }
         }
@@ -72,34 +113,55 @@ int run_inference(int argc, char* argv[])
     }
 
     if (tokenizer_path.empty() || model_path.empty() || prompt.empty() || max_new_tokens < 0 ||
-        (device != "cpu" && device != "cuda"))
+        max_seq_len <= 0 || (device != "cpu" && device != "cuda") ||
+        (model_type != "llama2" && model_type != "qwen3"))
     {
         print_inference_usage(argv[0]);
         return 2;
     }
 
-    my_vllm::LLama2Model model(my_vllm::TokenizerType::kEncodeSpe, tokenizer_path, model_path, quant);
     const my_vllm::DeviceType device_type = device == "cuda"
                                                 ? my_vllm::DeviceType::kDeviceCUDA
                                                 : my_vllm::DeviceType::kDeviceCPU;
-    my_vllm::Status status = model.init(device_type);
-    if (!status)
+    if (model_type == "qwen3")
     {
-        std::cerr << "Model initialization failed: " << status.get_err_msg() << '\n';
-        return 1;
+        if (quant)
+        {
+            std::cerr << "--quant applies only to the legacy Llama2 binary format.\n";
+            return 2;
+        }
+        my_vllm::Qwen3Model model(tokenizer_path, model_path, max_seq_len);
+        return run_initialized_model(model, device_type, prompt, max_new_tokens);
     }
 
-    std::string generated;
-    status = model.generate(prompt, max_new_tokens, generated);
-    if (!status)
-    {
-        std::cerr << "Generation failed: " << status.get_err_msg() << '\n';
-        return 1;
-    }
-    std::cout << generated << std::endl;
-    return 0;
+    my_vllm::LLama2Model model(my_vllm::TokenizerType::kEncodeSpe, tokenizer_path, model_path, quant);
+    return run_initialized_model(model, device_type, prompt, max_new_tokens);
 }
 } // namespace
+
+TEST(Qwen3Tokenizer, ByteLevelUtf8RoundTrip)
+{
+    const std::string tokenizer_path = std::string(MYVLLM_SOURCE_DIR) +
+                                       "/Qwen3-0.6B/tokenizer.json";
+    my_vllm::Qwen3EncodeLayer tokenizer(tokenizer_path);
+    const std::string text = "Hi there! 123\n你好，Qwen3🙂";
+    const auto ids = tokenizer.encode(text);
+    EXPECT_FALSE(ids.empty());
+    EXPECT_EQ(tokenizer.decode(ids), text);
+    EXPECT_EQ(tokenizer.encode("Hi"), std::vector<int32_t>{13048});
+}
+
+TEST(Qwen3Tokenizer, AddedChatTokensUseTheirConfiguredIds)
+{
+    const std::string tokenizer_path = std::string(MYVLLM_SOURCE_DIR) +
+                                       "/Qwen3-0.6B/tokenizer.json";
+    my_vllm::Qwen3EncodeLayer tokenizer(tokenizer_path);
+    const auto ids = tokenizer.encode("<|im_start|>user<|im_end|>");
+    ASSERT_GE(ids.size(), 3u);
+    EXPECT_EQ(ids.front(), 151644);
+    EXPECT_EQ(ids.back(), 151645);
+    EXPECT_TRUE(tokenizer.is_sentence_ending(ids.back()));
+}
 
 int main(int argc, char *argv[]) 
 {

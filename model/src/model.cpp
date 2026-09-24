@@ -185,6 +185,7 @@ namespace my_vllm
         config_->kv_dim_ = (config.dim * config.kv_head_num) / config.head_num;
         config_->kv_mul_ = config.head_num / config.kv_head_num;
         config_->head_size_ = config.dim / config.head_num;
+        config_->query_dim_ = config.dim;
 
         if (config.vocab_size > 0)
         {
