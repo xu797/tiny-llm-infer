@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "model.h"
 
@@ -72,25 +73,38 @@ namespace my_vllm
         FILE *file = fopen(model_path_.data(), "rb");
         if (!file)
         {
+            close(fd);
             return PathNotValid("Failed to open the file. The path may be invalid.");
         }
 
         auto config = ModelConfig{};
         if (fread(&config, sizeof(ModelConfig), 1, file) != 1) // 读取bin文件header
         {
+            fclose(file);
+            close(fd);
             return ModelParseError("Failed to retrieve the configuration information from the model file.");
         }
         if (is_quant_model_)
         {
             if (fread(&group_size_, sizeof(int32_t), 1, file) != 1)
             {
+                fclose(file);
+                close(fd);
                 return ModelParseError("Failed to retrieve the group size information from the model file.");
+            }
+            if (group_size_ <= 0)
+            {
+                fclose(file);
+                close(fd);
+                return ModelParseError("The quantization group size must be positive.");
             }
         }
 
         auto gen_status = generate_model_infos(config);
         if (!gen_status)
         {
+            fclose(file);
+            close(fd);
             return gen_status;
         }
 
@@ -102,8 +116,21 @@ namespace my_vllm
         {
             raw_model_data_ = std::make_shared<RawModelDataInt8>();
         }
-        fseek(file, 0, SEEK_END);
-        raw_model_data_->file_size = ftell(file);
+        if (fseek(file, 0, SEEK_END) != 0)
+        {
+            fclose(file);
+            close(fd);
+            return ModelParseError("Failed to determine the model file size.");
+        }
+        const long file_size = ftell(file);
+        const size_t header_size = sizeof(ModelConfig) + (is_quant_model_ ? sizeof(group_size_) : 0);
+        if (file_size < 0 || static_cast<size_t>(file_size) <= header_size)
+        {
+            fclose(file);
+            close(fd);
+            return ModelParseError("The model file is too small to contain its weights.");
+        }
+        raw_model_data_->file_size = static_cast<size_t>(file_size);
         fclose(file);
 
         raw_model_data_->fd = fd;
@@ -131,6 +158,23 @@ namespace my_vllm
 
     Status Model::generate_model_infos(const ModelConfig &config) const
     {
+        const int64_t vocab_size = config.vocab_size < 0
+                                       ? -static_cast<int64_t>(config.vocab_size)
+                                       : static_cast<int64_t>(config.vocab_size);
+        if (config.dim <= 0 || config.hidden_dim <= 0 || config.layer_num <= 0 ||
+            config.head_num <= 0 || config.kv_head_num <= 0 || config.seq_len <= 0 ||
+            vocab_size <= 0 || config.dim % config.head_num != 0 ||
+            config.head_num % config.kv_head_num != 0 ||
+            (config.dim / config.head_num) % 2 != 0)
+        {
+            return ModelParseError("The model header contains invalid Llama dimensions.");
+        }
+        if (tokenizer_type_ == TokenizerType::kEncodeSpe && encode_layer_ &&
+            vocab_size != encode_layer_->vocab_size())
+        {
+            return ModelParseError("The SentencePiece vocabulary size does not match the model header.");
+        }
+
         config_->dim_ = config.dim;
         config_->hidden_dim_ = config.hidden_dim;
         config_->layer_num_ = config.layer_num;
@@ -141,6 +185,7 @@ namespace my_vllm
         config_->kv_dim_ = (config.dim * config.kv_head_num) / config.head_num;
         config_->kv_mul_ = config.head_num / config.kv_head_num;
         config_->head_size_ = config.dim / config.head_num;
+        config_->query_dim_ = config.dim;
 
         if (config.vocab_size > 0)
         {
@@ -157,7 +202,7 @@ namespace my_vllm
         //   return ModelParseError(
         //       "Vocabulary size mismatch between the model file and the token list.");
         // }
-        config_->vocab_size_ = std::abs(config.vocab_size);
+        config_->vocab_size_ = static_cast<int32_t>(vocab_size);
         return Success();
     }
 

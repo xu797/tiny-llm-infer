@@ -37,7 +37,7 @@ namespace my_vllm
             swiglu_layer_->to_cuda();
         }
 
-        if (cls_layer_)
+        if (cls_layer_ && !tied_weights_)
         {
             cls_layer_->set_cuda_config(config);
             cls_layer_->to_cuda();
@@ -47,6 +47,17 @@ namespace my_vllm
         {
             embedding_layer_->set_cuda_config(config);
             embedding_layer_->to_cuda();
+        }
+
+        // Qwen3 ties lm_head.weight to embed_tokens.weight. Reuse the CUDA
+        // embedding allocation instead of copying the 600 MB matrix twice.
+        if (tied_weights_ && cls_layer_ && embedding_layer_)
+        {
+            auto cls = std::dynamic_pointer_cast<LayerParam>(cls_layer_);
+            auto embedding = std::dynamic_pointer_cast<LayerParam>(embedding_layer_);
+            CHECK(cls != nullptr && embedding != nullptr);
+            CHECK(cls->set_weight(0, embedding->get_weight(0)));
+            cls_layer_->set_cuda_config(config);
         }
 
         if (mha_layer_)
@@ -122,8 +133,25 @@ namespace my_vllm
         {
             if (rms_norm_layer)
             {
-                rms_norm_layer->to_cuda();
                 rms_norm_layer->set_cuda_config(config);
+                rms_norm_layer->to_cuda();
+            }
+        }
+
+        for (auto &norm_layer : qnorm_layers_)
+        {
+            if (norm_layer)
+            {
+                norm_layer->set_cuda_config(config);
+                norm_layer->to_cuda();
+            }
+        }
+        for (auto &norm_layer : knorm_layers_)
+        {
+            if (norm_layer)
+            {
+                norm_layer->set_cuda_config(config);
+                norm_layer->to_cuda();
             }
         }
     }
@@ -131,6 +159,16 @@ namespace my_vllm
     LLama2Model::LLama2Model(TokenizerType tokenizer_type, std::string token_path, std::string model_path, bool is_quant_model)
         : Model(tokenizer_type, ModelType::kModelTypeLLama2, std::move(token_path), std::move(model_path), is_quant_model)
     {
+    }
+
+    LLama2Model::~LLama2Model()
+    {
+        if (cuda_config_ && cuda_config_->stream)
+        {
+            cudaStreamSynchronize(cuda_config_->stream);
+            cudaStreamDestroy(cuda_config_->stream);
+            cuda_config_->stream = nullptr;
+        }
     }
 
     Status LLama2Model::init(DeviceType device_type)
@@ -143,17 +181,24 @@ namespace my_vllm
         {
             return InternalError("The cpu device do not support int8 quant model.");
         }
+        if (device_type != DeviceType::kDeviceCPU && device_type != DeviceType::kDeviceCUDA)
+        {
+            return InvalidArgument("The requested device type is not supported.");
+        }
 
         device_type_ = device_type;
         if (device_type == DeviceType::kDeviceCUDA)
         {
-            cudaSetDevice(0);
-            cuda_config_ = std::make_shared<CudaConfig>();
-            cudaStreamCreate(&cuda_config_->stream);
-            cudaError_t err = cudaGetLastError();
+            cudaError_t err = cudaSetDevice(0);
             if (err != cudaSuccess)
             {
-                return InternalError("The cuda hanle create failed.");
+                return InternalError(std::string("Failed to select CUDA device 0: ") + cudaGetErrorString(err));
+            }
+            cuda_config_ = std::make_shared<CudaConfig>();
+            err = cudaStreamCreate(&cuda_config_->stream);
+            if (err != cudaSuccess)
+            {
+                return InternalError(std::string("Failed to create CUDA stream: ") + cudaGetErrorString(err));
             }
         }
 
@@ -186,6 +231,21 @@ namespace my_vllm
         if (input.is_empty())
         {
             return InvalidArgument("The input tensor is empty.");
+        }
+        if (!config_ || input.data_type() != DataType::kDataTypeFp32 ||
+            input.device_type() != device_type_ || input.size() != static_cast<size_t>(config_->dim_))
+        {
+            return InvalidArgument("The model input must be one fp32 hidden-state vector on the model device.");
+        }
+        if (pos_tensor.is_empty() || pos_tensor.data_type() != DataType::kDataTypeInt32 ||
+            pos_tensor.device_type() != DeviceType::kDeviceCPU || pos_tensor.size() != 1)
+        {
+            return InvalidArgument("The position tensor must contain one CPU int32 value.");
+        }
+        const int32_t pos = pos_tensor.ptr<int32_t>()[0];
+        if (pos < 0 || pos >= config_->seq_len_)
+        {
+            return InvalidArgument("The input position is outside the model context window.");
         }
         if (device_type_ == DeviceType::kDeviceCPU && is_quant_model_)
         {
@@ -492,6 +552,86 @@ namespace my_vllm
         return encode_layer_->encode(sentence);
     }
 
+    Status LLama2Model::generate(const std::string& prompt, int32_t max_new_tokens,
+                                 std::string& output)
+    {
+        output.clear();
+        if (!config_ || !encode_layer_ || !sampler_)
+        {
+            return InternalError("The model must be initialized before generation.");
+        }
+        if (max_new_tokens < 0)
+        {
+            return InvalidArgument("The number of generated tokens cannot be negative.");
+        }
+        if (max_new_tokens == 0)
+        {
+            return Success();
+        }
+
+        const std::vector<int32_t> token_ids = encode(prompt);
+        if (token_ids.empty())
+        {
+            return InvalidArgument("The prompt did not produce any tokens.");
+        }
+        if (token_ids.size() > static_cast<size_t>(config_->seq_len_))
+        {
+            return InvalidArgument("The prompt is longer than the model context window.");
+        }
+        const int32_t max_context_tokens = config_->seq_len_ - static_cast<int32_t>(token_ids.size()) + 1;
+        if (max_new_tokens > max_context_tokens)
+        {
+            return InvalidArgument("The requested generation length exceeds the model context window.");
+        }
+
+        const std::vector<int> prompt_tokens(token_ids.begin(), token_ids.end());
+        const EmbeddingOutput prompt_embedding = embedding(prompt_tokens);
+        Tensor& pos_tensor = get_buffer(ModelBufferType::kInputPos);
+        int next = -1;
+        for (size_t i = 0; i < token_ids.size(); ++i)
+        {
+            pos_tensor.index<int32_t>(0) = static_cast<int32_t>(i);
+            const Tensor input = fill_input(pos_tensor, prompt_embedding, true);
+            const bool skip_sampling = i + 1 < token_ids.size();
+            const Status status = predict(input, pos_tensor, skip_sampling, next);
+            if (!status)
+            {
+                return status;
+            }
+        }
+
+        std::vector<int32_t> generated_tokens;
+        generated_tokens.reserve(max_new_tokens);
+        for (int32_t i = 0; i < max_new_tokens; ++i)
+        {
+            if (next < 0)
+            {
+                return InternalError("The model did not produce a token after processing the prompt.");
+            }
+            if (is_sentence_ending(next))
+            {
+                break;
+            }
+            generated_tokens.push_back(next);
+            if (i + 1 == max_new_tokens)
+            {
+                break;
+            }
+
+            const std::vector<int> next_token{next};
+            const EmbeddingOutput next_embedding = embedding(next_token);
+            pos_tensor.index<int32_t>(0) = static_cast<int32_t>(token_ids.size()) + i;
+            const Tensor input = fill_input(pos_tensor, next_embedding, false);
+            const Status status = predict(input, pos_tensor, false, next);
+            if (!status)
+            {
+                return status;
+            }
+        }
+        output = decode(generated_tokens);
+        return Success();
+    }
+
     bool LLama2Model::is_sentence_ending(int32_t token_idx) const
     {
         CHECK(this->encode_layer_ != nullptr);
@@ -544,9 +684,11 @@ namespace my_vllm
 
         Tensor rms_output(DataType::kDataTypeFp32, config_->dim_, true, alloc);
         CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
-        CHECK(insert_buffer(ModelBufferType::kOutputMHA, rms_output));
         CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
         CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
+        Tensor mha_output(DataType::kDataTypeFp32,
+                          config_->query_dim_ > 0 ? config_->query_dim_ : config_->dim_, true, alloc);
+        CHECK(insert_buffer(ModelBufferType::kOutputMHA, mha_output));
 
         Tensor w1_output(DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
         Tensor w3_output(DataType::kDataTypeFp32, config_->hidden_dim_, true, alloc);
@@ -564,7 +706,8 @@ namespace my_vllm
         CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
 
         // Wq query output
-        Tensor query(DataType::kDataTypeFp32, config_->dim_, true, alloc);
+        const int32_t query_dim = config_->query_dim_ > 0 ? config_->query_dim_ : config_->dim_;
+        Tensor query(DataType::kDataTypeFp32, query_dim, true, alloc);
         CHECK(insert_buffer(ModelBufferType::kQuery, query));
 
         // Pos tensor
@@ -573,8 +716,9 @@ namespace my_vllm
 
         // Attention output
         Tensor attn(DataType::kDataTypeFp32, config_->head_num_, config_->seq_len_, true, alloc);
+        Tensor attn_output(DataType::kDataTypeFp32, config_->dim_, true, alloc);
         CHECK(insert_buffer(ModelBufferType::kScoreStorage, attn));
-        CHECK(insert_buffer(ModelBufferType::kAttnOutput, query));
+        CHECK(insert_buffer(ModelBufferType::kAttnOutput, attn_output));
 
         // final forward output
         Tensor forward_output(DataType::kDataTypeFp32, config_->vocab_size_, true, alloc);

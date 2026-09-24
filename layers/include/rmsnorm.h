@@ -8,7 +8,7 @@ namespace my_vllm
 class RmsNormLayer : public LayerParam 
 {
 public:
-    explicit RmsNormLayer(DeviceType device_type, int32_t dim);
+    explicit RmsNormLayer(DeviceType device_type, int32_t dim, float eps = 1e-5f);
 
     Status check() const override;
 
@@ -16,6 +16,7 @@ public:
 
 private:
     int32_t dim_ = 0;
+    float eps_ = 1e-5f;
 };
 }  
 #endif  // MYVLLM_LAYERS_RMSNORM_H_
