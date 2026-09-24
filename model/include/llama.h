@@ -38,10 +38,13 @@ class LLama2Model : public Model
 {
 public:
     explicit LLama2Model(TokenizerType tokenizer_type, std::string token_path, std::string model_path, bool is_quant_model);
+    ~LLama2Model() override;
 
     Status init(DeviceType device_type) override;
 
     Status predict(const Tensor& input, const Tensor& pos_tensor, bool is_prompt, int& next) const override;
+
+    Status generate(const std::string& prompt, int32_t max_new_tokens, std::string& output);
 
     Status forward(const Tensor& input, const Tensor& pos_tensor, int& next) const override;
 

@@ -23,9 +23,9 @@ void emb_kernel_normal(const Tensor& input, const Tensor& weight,
     for (int32_t i = 0; i < input_num; ++i)
     {
         int32_t token = *input.ptr<int32_t>(i);
-        if (token > vocab_size) 
+        if (token < 0 || token >= vocab_size)
         {
-            LOG(FATAL) << "Token index is greater than vocab size.";
+            LOG(FATAL) << "Token index is outside the embedding vocabulary.";
         } 
         else 
         {
@@ -43,4 +43,4 @@ void emb_kernel_normal(const Tensor& input, const Tensor& weight,
     }
 }
 
-} 
+}
