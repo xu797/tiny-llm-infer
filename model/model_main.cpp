@@ -1,10 +1,14 @@
+#include <algorithm>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "llama.h"
 #include "qwen3.h"
+#include "llm_engine.h"
+#include "qwen3_runner.h"
 
 namespace
 {
@@ -12,8 +16,60 @@ void print_inference_usage(const char* program)
 {
     std::cerr << "Usage: " << program
               << " --infer --tokenizer <tokenizer-file> --model <weights-file>"
-                 " --prompt <text> [--model-type llama2|qwen3] [--device cpu|cuda]"
+                 " --prompt <text> [--prompt <text> ...] [--model-type llama2|qwen3] [--device cpu|cuda]"
                  " [--max-new-tokens <count>] [--max-seq-len <count>] [--quant]\n";
+}
+
+int run_qwen3_engine(my_vllm::Qwen3Model& model,
+                      my_vllm::DeviceType device_type,
+                      const std::vector<std::string>& prompts, int max_new_tokens,
+                      int max_seq_len)
+{
+    my_vllm::Status status = model.init(device_type);
+    if (!status)
+    {
+        std::cerr << "Model initialization failed: " << status.get_err_msg() << '\n';
+        return 1;
+    }
+    if (max_new_tokens == 0)
+    {
+        for (size_t i = 0; i < prompts.size(); ++i) std::cout << std::endl;
+        return 0;
+    }
+
+    my_vllm::engine::Qwen3ModelRunner runner(model);
+    my_vllm::engine::EngineConfig config;
+    config.max_model_len = max_seq_len;
+    config.scheduler.max_num_seqs =
+        std::min<int32_t>(16, static_cast<int32_t>(prompts.size()));
+    config.scheduler.max_num_batched_tokens = std::min(max_seq_len, 256);
+    config.scheduler.block_size = 16;
+    config.scheduler.num_kv_blocks = (max_seq_len + config.scheduler.block_size - 1) /
+                                     config.scheduler.block_size;
+    my_vllm::engine::LLMEngine engine(runner, config);
+    status = engine.init();
+    if (!status)
+    {
+        std::cerr << "Engine initialization failed: " << status.get_err_msg() << '\n';
+        return 1;
+    }
+
+    my_vllm::engine::SamplingParams sampling;
+    sampling.max_tokens = max_new_tokens;
+    std::vector<my_vllm::engine::GenerationResult> results;
+    status = engine.generate(prompts, {sampling}, results);
+    if (!status)
+    {
+        std::cerr << "Generation failed: " << status.get_err_msg() << '\n';
+        return 1;
+    }
+    if (results.size() != prompts.size())
+    {
+        std::cerr << "The engine returned an incomplete result set.\n";
+        return 1;
+    }
+    for (const auto& result : results) std::cout << result.text << std::endl;
+    return 0;
 }
 
 template <typename ModelT>
@@ -41,7 +97,7 @@ int run_inference(int argc, char* argv[])
 {
     std::string tokenizer_path;
     std::string model_path;
-    std::string prompt;
+    std::vector<std::string> prompts;
     std::string device = "cpu";
     std::string model_type = "llama2";
     int max_new_tokens = 64;
@@ -61,7 +117,7 @@ int run_inference(int argc, char* argv[])
         }
         else if (arg == "--prompt" && i + 1 < argc)
         {
-            prompt = argv[++i];
+            prompts.emplace_back(argv[++i]);
         }
         else if (arg == "--device" && i + 1 < argc)
         {
@@ -112,8 +168,11 @@ int run_inference(int argc, char* argv[])
         }
     }
 
-    if (tokenizer_path.empty() || model_path.empty() || prompt.empty() || max_new_tokens < 0 ||
-        max_seq_len <= 0 || (device != "cpu" && device != "cuda") ||
+    if (tokenizer_path.empty() || model_path.empty() || prompts.empty() ||
+        std::any_of(prompts.begin(), prompts.end(), [](const std::string& value) {
+            return value.empty();
+        }) || max_new_tokens < 0 || max_seq_len <= 0 ||
+        (device != "cpu" && device != "cuda") ||
         (model_type != "llama2" && model_type != "qwen3"))
     {
         print_inference_usage(argv[0]);
@@ -131,11 +190,16 @@ int run_inference(int argc, char* argv[])
             return 2;
         }
         my_vllm::Qwen3Model model(tokenizer_path, model_path, max_seq_len);
-        return run_initialized_model(model, device_type, prompt, max_new_tokens);
+        return run_qwen3_engine(model, device_type, prompts, max_new_tokens, max_seq_len);
     }
 
+    if (prompts.size() != 1)
+    {
+        std::cerr << "The legacy Llama2 path accepts exactly one --prompt.\n";
+        return 2;
+    }
     my_vllm::LLama2Model model(my_vllm::TokenizerType::kEncodeSpe, tokenizer_path, model_path, quant);
-    return run_initialized_model(model, device_type, prompt, max_new_tokens);
+    return run_initialized_model(model, device_type, prompts.front(), max_new_tokens);
 }
 } // namespace
 

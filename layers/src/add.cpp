@@ -11,32 +11,17 @@ VecAddLayer::VecAddLayer(DeviceType device_type)
     reset_output_size(1);
 }
 
-Status VecAddLayer::check() const 
+Status VecAddLayer::check() const
 {
-    Tensor input1 = this->get_input(0);
-    Tensor input2 = this->get_input(1);
-    int32_t size = input1.size();
-    Status status;
-    status = check_tensor_with_dim(input1, device_type_, data_type_, size);
-    if (!status) 
-    {
-        LOG(ERROR) << "The input tensor 1 error in the add layer.";
-        return status;
-    }
-
-    status = check_tensor_with_dim(input2, device_type_, data_type_, size);
-    if (!status)
-    {
-        LOG(ERROR) << "The input tensor 2 error in the add layer.";
-        return status;
-    }
-
-    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, size);
-    if (!status) 
-    {
-        LOG(ERROR) << "The output tensor error in the add layer.";
-        return status;
-    }
+    const Tensor& input1 = get_input(0);
+    const Tensor& input2 = get_input(1);
+    const Tensor& output = get_output(0);
+    if (input1.is_empty() || input2.is_empty() || output.is_empty() ||
+        input1.device_type() != device_type_ || input2.device_type() != device_type_ ||
+        output.device_type() != device_type_ || input1.data_type() != data_type_ ||
+        input2.data_type() != data_type_ || output.data_type() != data_type_ ||
+        input1.dims() != input2.dims() || input1.dims() != output.dims())
+        return InvalidArgument("The add layer tensors must have the same shape and device.");
     return Success();
 }
 
