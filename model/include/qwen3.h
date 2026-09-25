@@ -54,6 +54,19 @@ public:
     Status generate(const std::string& prompt, int32_t max_new_tokens,
                     std::string& output);
 
+    Status configure_paged_kv_cache(int32_t num_blocks, int32_t block_size,
+                                    int32_t max_batch_tokens);
+    Status set_paged_block_table(const std::vector<int32_t>& block_table);
+    Status forward_paged_token(int32_t token_id, int32_t position);
+    Status forward_paged_batch(const std::vector<int32_t>& token_ids,
+                               const std::vector<int32_t>& positions,
+                               const std::vector<std::vector<int32_t>>& block_tables,
+                               const std::vector<size_t>& sample_rows,
+                               std::vector<std::vector<float>>& logits);
+    Status copy_logits_to_host(std::vector<float>& logits) const;
+    std::vector<int32_t> tokenize_prompt(const std::string& prompt) const;
+    std::string decode_tokens(const std::vector<int32_t>& token_ids) const;
+
     bool is_sentence_ending(int32_t token_idx) const override;
     std::string decode(int32_t token_idx) const override;
     std::string decode(std::vector<int32_t> token_idxs) const override;
@@ -87,6 +100,9 @@ private:
                       bool is_prompt) const;
     Status attention_rms(int32_t layer_idx, const Tensor& input) const;
     Status attention_mha(int32_t layer_idx, const Tensor& pos_tensor) const;
+    Status attention_mha_paged(int32_t layer_idx, int32_t position) const;
+    std::pair<Tensor, Tensor> slice_paged_kv_cache(int32_t layer_idx, int32_t position) const;
+    Status forward_paged(const Tensor& input, const Tensor& pos_tensor) const;
     Status feed_forward(int32_t layer_idx, const Tensor& input) const;
     Status cls_logits(const Tensor& input) const;
 
@@ -100,6 +116,13 @@ private:
 
     std::shared_ptr<CudaConfig> cuda_config_;
     std::unique_ptr<Qwen3Layers> qwen3_layers_;
+    int32_t paged_num_blocks_ = 0;
+    int32_t paged_block_size_ = 0;
+    int32_t paged_max_batch_tokens_ = 0;
+    int32_t paged_max_table_entries_ = 0;
+    Tensor paged_block_table_host_;
+    Tensor paged_block_table_device_;
+    std::vector<int32_t> paged_block_table_ids_;
 
     int safetensors_fd_ = -1;
     void* safetensors_mapping_ = nullptr;

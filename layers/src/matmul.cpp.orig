@@ -23,35 +23,49 @@ namespace my_vllm
 
   Status MatmulLayer::check() const
   {
-    const Tensor& input = get_input(0);
-    const Tensor& weight = get_weight(0);
-    const Tensor& output = get_output(0);
-    if (input.is_empty() || input.device_type() != device_type_ ||
-        input.data_type() != data_type_ ||
-        (input.dims_size() != 1 && input.dims_size() != 2) ||
-        input.get_dim(input.dims_size() - 1) != dim1_)
-      return InvalidArgument("The input tensor shape is invalid in the matmul layer.");
+    auto status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim1_);
+    if (!status)
+    {
+      LOG(ERROR) << "The input tensor error in the matmul layer.";
+      return status;
+    }
 
-    const DataType weight_type = is_quant_layer_ ? DataType::kDataTypeInt8 : data_type_;
-    if (weight.is_empty() || weight.device_type() != device_type_ ||
-        weight.data_type() != weight_type || weight.dims_size() != 2 ||
-        weight.get_dim(0) != dim0_ || weight.get_dim(1) != dim1_)
-      return InvalidArgument("The weight tensor shape is invalid in the matmul layer.");
+    if (!is_quant_layer_)
+    {
+      status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, dim0_, dim1_);
+      if (!status)
+      {
+        LOG(ERROR) << "The weight tensor error in the matmul layer.";
+        return status;
+      }
+    }
+    else
+    {
+      status = check_tensor_with_dim(get_weight(0), device_type_, DataType::kDataTypeInt8,
+                                     dim0_, dim1_);
+      if (!status)
+      {
+        LOG(ERROR) << "The weight tensor error in the matmul layer.";
+        return status;
+      }
+    }
 
     if (is_quant_layer_)
     {
-      const Status status = check_tensor(scales_, device_type_, DataType::kDataTypeFp32);
-      if (!status) return status;
+      status = check_tensor_with_dim(scales_, device_type_, DataType::kDataTypeFp32, scales_.size());
+      if (!status)
+      {
+        LOG(ERROR) << "The scale tensor error in the matmul layer.";
+        return status;
+      }
     }
 
-    const bool output_shape_valid =
-        input.dims_size() == 1
-            ? output.dims_size() == 1 && output.get_dim(0) == dim0_
-            : output.dims_size() == 2 && output.get_dim(0) == input.get_dim(0) &&
-                  output.get_dim(1) == dim0_;
-    if (output.is_empty() || output.device_type() != device_type_ ||
-        output.data_type() != data_type_ || !output_shape_valid)
-      return InvalidArgument("The output tensor shape is invalid in the matmul layer.");
+    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, dim0_);
+    if (!status)
+    {
+      LOG(ERROR) << "The output tensor error in the matmul layer.";
+      return status;
+    }
     return Success();
   }
 
