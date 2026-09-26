@@ -8,7 +8,7 @@ namespace my_vllm
 
 EmbeddingLayer::EmbeddingLayer(DeviceType device_type, int32_t dim, int32_t seq_len, int32_t vocab_size)
     : dim_(dim), seq_len_(seq_len), vocab_size_(vocab_size),
-    LayerParam(device_type, LayerType::kLayerEmbedding, false, "Embedding")
+    LayerParam(device_type, LayerType::kLayerEmbedding, "Embedding")
 {
     reset_weight_size(1);
     reset_input_size(2);

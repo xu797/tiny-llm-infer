@@ -43,52 +43,6 @@ __device__ void paged_softmax(float* values, int32_t size)
     }
 }
 
-__global__ void paged_attention_kernel(
-    int32_t position, int32_t layer_index, int32_t num_blocks, int32_t block_size,
-    int32_t score_stride, int32_t kv_dim, int32_t kv_mul, int32_t head_size,
-    const float* query, float* output, float* scores, const float* key_cache,
-    const float* value_cache, const int32_t* block_table)
-{
-    const int32_t head = blockIdx.x;
-    const int32_t head_offset = (head / kv_mul) * head_size;
-    const int32_t context_len = position + 1;
-    const float scale = rsqrtf(static_cast<float>(head_size));
-    float* head_scores = scores + head * score_stride;
-
-    for (int32_t token = threadIdx.x; token < context_len; token += blockDim.x)
-    {
-        const int32_t page = block_table[token / block_size];
-        const size_t cache_offset =
-            ((static_cast<size_t>(layer_index) * num_blocks + page) * block_size +
-             token % block_size) * kv_dim + head_offset;
-        float dot = 0.0f;
-        for (int32_t dim = 0; dim < head_size; ++dim)
-        {
-            dot += query[head * head_size + dim] * key_cache[cache_offset + dim];
-        }
-        head_scores[token] = dot * scale;
-    }
-    __syncthreads();
-
-    paged_softmax(head_scores, context_len);
-    __syncthreads();
-
-    float* head_output = output + head * head_size;
-    for (int32_t dim = threadIdx.x; dim < head_size; dim += blockDim.x)
-    {
-        float value = 0.0f;
-        for (int32_t token = 0; token < context_len; ++token)
-        {
-            const int32_t page = block_table[token / block_size];
-            const size_t cache_offset =
-                ((static_cast<size_t>(layer_index) * num_blocks + page) * block_size +
-                 token % block_size) * kv_dim + head_offset;
-            value += head_scores[token] * value_cache[cache_offset + dim];
-        }
-        head_output[dim] = value;
-    }
-}
-
 __global__ void paged_kv_cache_store_batch_kernel(
     int32_t rows, int32_t layer_index, int32_t num_blocks, int32_t block_size,
     int32_t kv_dim, int32_t max_table_entries, const int32_t* positions,
@@ -161,23 +115,6 @@ __global__ void paged_attention_batch_kernel(
         output[output_offset + dim] = value;
     }
 }
-}
-
-void paged_attention_cuda(int32_t position, int32_t head_num, int32_t layer_index,
-                          int32_t num_blocks, int32_t block_size, int32_t score_stride,
-                          int32_t kv_dim, int32_t kv_mul, int32_t head_size,
-                          const Tensor& output, const Tensor& query,
-                          const Tensor& score, const Tensor& key_cache,
-                          const Tensor& value_cache, const Tensor& block_table,
-                          CudaConfig* config)
-{
-    CHECK(config != nullptr);
-    paged_attention_kernel<<<head_num, kThreads, 0, config->stream>>>(
-        position, layer_index, num_blocks, block_size, score_stride, kv_dim, kv_mul,
-        head_size, query.ptr<float>(), const_cast<float*>(output.ptr<float>()),
-        const_cast<float*>(score.ptr<float>()), key_cache.ptr<float>(),
-        value_cache.ptr<float>(), block_table.ptr<int32_t>());
-    CHECK_EQ(cudaGetLastError(), cudaSuccess);
 }
 
 void paged_kv_cache_store_batch_cuda(

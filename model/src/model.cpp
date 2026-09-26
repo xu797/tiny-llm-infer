@@ -1,18 +1,11 @@
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-
 #include "model.h"
 
 namespace my_vllm
 {
-    Model::Model(TokenizerType tokenizer_type, ModelType model_type,
-                 std::string token_path, std::string model_path, bool is_quant_model)
-        : tokenizer_type_(tokenizer_type),
-          model_type_(model_type),
+    Model::Model(ModelType model_type, std::string token_path, std::string model_path)
+        : model_type_(model_type),
           token_path_(std::move(token_path)),
-          model_path_(std::move(model_path)),
-          is_quant_model_(is_quant_model)
+          model_path_(std::move(model_path))
     {
     }
 
@@ -57,122 +50,15 @@ namespace my_vllm
         return buffers_.at(buffer_idx);
     }
 
-    Status Model::read_model_file()
+    Status Model::generate_model_infos(const ModelConfig& config) const
     {
-
-        if (model_path_.empty())
-        {
-            return PathNotValid("Failed to open the weight file, the model path is empty!");
-        }
-        int32_t fd = open(model_path_.data(), O_RDONLY);
-        if (fd == -1)
-        {
-            return PathNotValid("Failed to open the weight file " + model_path_ + " may be the path does not exist!");
-        }
-
-        FILE *file = fopen(model_path_.data(), "rb");
-        if (!file)
-        {
-            close(fd);
-            return PathNotValid("Failed to open the file. The path may be invalid.");
-        }
-
-        auto config = ModelConfig{};
-        if (fread(&config, sizeof(ModelConfig), 1, file) != 1) // 读取bin文件header
-        {
-            fclose(file);
-            close(fd);
-            return ModelParseError("Failed to retrieve the configuration information from the model file.");
-        }
-        if (is_quant_model_)
-        {
-            if (fread(&group_size_, sizeof(int32_t), 1, file) != 1)
-            {
-                fclose(file);
-                close(fd);
-                return ModelParseError("Failed to retrieve the group size information from the model file.");
-            }
-            if (group_size_ <= 0)
-            {
-                fclose(file);
-                close(fd);
-                return ModelParseError("The quantization group size must be positive.");
-            }
-        }
-
-        auto gen_status = generate_model_infos(config);
-        if (!gen_status)
-        {
-            fclose(file);
-            close(fd);
-            return gen_status;
-        }
-
-        if (!is_quant_model_)
-        {
-            raw_model_data_ = std::make_shared<RawModelDataFp32>();
-        }
-        else
-        {
-            raw_model_data_ = std::make_shared<RawModelDataInt8>();
-        }
-        if (fseek(file, 0, SEEK_END) != 0)
-        {
-            fclose(file);
-            close(fd);
-            return ModelParseError("Failed to determine the model file size.");
-        }
-        const long file_size = ftell(file);
-        const size_t header_size = sizeof(ModelConfig) + (is_quant_model_ ? sizeof(group_size_) : 0);
-        if (file_size < 0 || static_cast<size_t>(file_size) <= header_size)
-        {
-            fclose(file);
-            close(fd);
-            return ModelParseError("The model file is too small to contain its weights.");
-        }
-        raw_model_data_->file_size = static_cast<size_t>(file_size);
-        fclose(file);
-
-        raw_model_data_->fd = fd;
-        raw_model_data_->data = mmap(nullptr, raw_model_data_->file_size, PROT_READ, MAP_PRIVATE, raw_model_data_->fd, 0);
-
-        if (raw_model_data_->data == MAP_FAILED || raw_model_data_->data == nullptr)
-        {
-            return ModelParseError("Failed to map the weight file " + model_path_ + " into memory.");
-        }
-        if (!is_quant_model_)
-        {
-            raw_model_data_->weight_data = static_cast<int8_t *>(raw_model_data_->data) + sizeof(ModelConfig);
-        }
-        else
-        {
-            raw_model_data_->weight_data = static_cast<int8_t *>(raw_model_data_->data) + sizeof(ModelConfig) + sizeof(group_size_);
-        }
-        if (raw_model_data_ == nullptr)
-        {
-            LOG(ERROR);
-            return ModelParseError("Failed to map the weight file " + model_path_ + " into memory, the pointer to weight start address is null");
-        }
-        return Success();
-    }
-
-    Status Model::generate_model_infos(const ModelConfig &config) const
-    {
-        const int64_t vocab_size = config.vocab_size < 0
-                                       ? -static_cast<int64_t>(config.vocab_size)
-                                       : static_cast<int64_t>(config.vocab_size);
         if (config.dim <= 0 || config.hidden_dim <= 0 || config.layer_num <= 0 ||
             config.head_num <= 0 || config.kv_head_num <= 0 || config.seq_len <= 0 ||
-            vocab_size <= 0 || config.dim % config.head_num != 0 ||
+            config.vocab_size <= 0 || config.dim % config.head_num != 0 ||
             config.head_num % config.kv_head_num != 0 ||
             (config.dim / config.head_num) % 2 != 0)
         {
-            return ModelParseError("The model header contains invalid Llama dimensions.");
-        }
-        if (tokenizer_type_ == TokenizerType::kEncodeSpe && encode_layer_ &&
-            vocab_size != encode_layer_->vocab_size())
-        {
-            return ModelParseError("The SentencePiece vocabulary size does not match the model header.");
+            return ModelParseError("The Qwen3 config contains invalid transformer dimensions.");
         }
 
         config_->dim_ = config.dim;
@@ -181,58 +67,11 @@ namespace my_vllm
         config_->head_num_ = config.head_num;
         config_->kv_head_num_ = config.kv_head_num;
         config_->seq_len_ = config.seq_len;
-
         config_->kv_dim_ = (config.dim * config.kv_head_num) / config.head_num;
         config_->kv_mul_ = config.head_num / config.kv_head_num;
         config_->head_size_ = config.dim / config.head_num;
         config_->query_dim_ = config.dim;
-
-        if (config.vocab_size > 0)
-        {
-            config_->is_shared_weight_ = true;
-        }
-        else
-        {
-            config_->is_shared_weight_ = false;
-        }
-
-        // Qwen tokenizer size and embedding size is mismatched
-        // refer: https://github.com/QwenLM/Qwen2.5/issues/29
-        // if (std::abs(config.vocab_size) != config_->vocab_size_) {
-        //   return ModelParseError(
-        //       "Vocabulary size mismatch between the model file and the token list.");
-        // }
-        config_->vocab_size_ = static_cast<int32_t>(vocab_size);
-        return Success();
-    }
-
-    Status Model::create_encode_layer()
-    {
-        // create token encode decode layer
-        if (tokenizer_type_ == TokenizerType::kEncodeSpe)
-        {
-            encode_layer_ = std::make_unique<SpeEncodeLayer>(this->token_path_, true, false);
-        }
-        else
-        {
-#ifdef LLAMA3_SUPPORT
-            encode_layer_ = std::make_unique<BpeEncodeLayer>(this->token_path_, true, false);
-#endif
-
-#ifdef QWEN2_SUPPORT
-            encode_layer_ = std::make_unique<QwenEncodeLayer>(this->token_path_, false, false);
-#endif
-        }
-        if (!encode_layer_)
-        {
-            return InternalError("Create the encode layer failed.");
-        }
-
-        config_->vocab_size_ = encode_layer_->vocab_size();
-        if (config_->vocab_size_ <= 0)
-        {
-            return InternalError("The vocab size param read error from the model file!");
-        }
+        config_->vocab_size_ = config.vocab_size;
         return Success();
     }
 
