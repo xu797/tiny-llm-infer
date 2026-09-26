@@ -138,17 +138,17 @@ Status Qwen3Model::forward_paged_batch(
     for (int32_t layer = 0; layer < config_->layer_num_; ++layer)
     {
         Tensor normalized = allocated_tensor(DataType::kDataTypeFp32, {rows, dim}, allocator);
-        status = qwen3_layers_->rmsnorm_layers_.at(layer)->forward(hidden, normalized);
+        status = qwen3_layers_->decoder_layers_.at(layer).input_norm_->forward(hidden, normalized);
         if (!status) return status;
 
         Tensor query = allocated_tensor(DataType::kDataTypeFp32, {rows, query_dim}, allocator);
         Tensor keys = allocated_tensor(DataType::kDataTypeFp32, {rows, kv_dim}, allocator);
         Tensor values = allocated_tensor(DataType::kDataTypeFp32, {rows, kv_dim}, allocator);
-        status = qwen3_layers_->wq_layers_.at(layer)->forward(normalized, query);
+        status = qwen3_layers_->decoder_layers_.at(layer).q_proj_->forward(normalized, query);
         if (!status) return status;
-        status = qwen3_layers_->wk_layers_.at(layer)->forward(normalized, keys);
+        status = qwen3_layers_->decoder_layers_.at(layer).k_proj_->forward(normalized, keys);
         if (!status) return status;
-        status = qwen3_layers_->wv_layers_.at(layer)->forward(normalized, values);
+        status = qwen3_layers_->decoder_layers_.at(layer).v_proj_->forward(normalized, values);
         if (!status) return status;
 
         Tensor query_heads = tensor_view(
@@ -159,9 +159,9 @@ Status Qwen3Model::forward_paged_batch(
             DataType::kDataTypeFp32,
             {rows * config_->kv_head_num_, config_->head_size_}, keys.ptr<float>(),
             device_type_);
-        status = qwen3_layers_->qnorm_layers_.at(layer)->forward(query_heads, query_heads);
+        status = qwen3_layers_->decoder_layers_.at(layer).q_norm_->forward(query_heads, query_heads);
         if (!status) return status;
-        status = qwen3_layers_->knorm_layers_.at(layer)->forward(key_heads, key_heads);
+        status = qwen3_layers_->decoder_layers_.at(layer).k_norm_->forward(key_heads, key_heads);
         if (!status) return status;
 
         if (device_type_ == DeviceType::kDeviceCPU)
@@ -254,7 +254,7 @@ Status Qwen3Model::forward_paged_batch(
 
         Tensor attention_output = allocated_tensor(
             DataType::kDataTypeFp32, {rows, dim}, allocator);
-        status = qwen3_layers_->wo_layers_.at(layer)->forward(mha_output,
+        status = qwen3_layers_->decoder_layers_.at(layer).o_proj_->forward(mha_output,
                                                                attention_output);
         if (!status) return status;
 
@@ -263,24 +263,23 @@ Status Qwen3Model::forward_paged_batch(
         if (!status) return status;
         Tensor ffn_normalized = allocated_tensor(
             DataType::kDataTypeFp32, {rows, dim}, allocator);
-        status = qwen3_layers_->rmsnorm_layers_.at(
-            layer + config_->layer_num_)->forward(residual, ffn_normalized);
+        status = qwen3_layers_->decoder_layers_.at(layer).post_attention_norm_->forward(residual, ffn_normalized);
         if (!status) return status;
 
         Tensor gate = allocated_tensor(
             DataType::kDataTypeFp32, {rows, hidden_dim}, allocator);
         Tensor up = allocated_tensor(
             DataType::kDataTypeFp32, {rows, hidden_dim}, allocator);
-        status = qwen3_layers_->w1_layers_.at(layer)->forward(ffn_normalized, gate);
+        status = qwen3_layers_->decoder_layers_.at(layer).gate_proj_->forward(ffn_normalized, gate);
         if (!status) return status;
-        status = qwen3_layers_->w3_layers_.at(layer)->forward(ffn_normalized, up);
+        status = qwen3_layers_->decoder_layers_.at(layer).up_proj_->forward(ffn_normalized, up);
         if (!status) return status;
         Tensor activated = allocated_tensor(
             DataType::kDataTypeFp32, {rows, hidden_dim}, allocator);
         status = qwen3_layers_->swiglu_layer_->forward(gate, up, activated);
         if (!status) return status;
         Tensor down = allocated_tensor(DataType::kDataTypeFp32, {rows, dim}, allocator);
-        status = qwen3_layers_->w2_layers_.at(layer)->forward(activated, down);
+        status = qwen3_layers_->decoder_layers_.at(layer).down_proj_->forward(activated, down);
         if (!status) return status;
 
         Tensor next_hidden = allocated_tensor(
@@ -292,8 +291,7 @@ Status Qwen3Model::forward_paged_batch(
 
     Tensor final_hidden = allocated_tensor(
         DataType::kDataTypeFp32, {rows, dim}, allocator);
-    status = qwen3_layers_->rmsnorm_layers_.at(
-        2 * config_->layer_num_)->forward(hidden, final_hidden);
+    status = qwen3_layers_->final_norm_->forward(hidden, final_hidden);
     if (!status) return status;
 
     logits.reserve(sample_rows.size());
@@ -304,7 +302,7 @@ Status Qwen3Model::forward_paged_batch(
             final_hidden.ptr<float>(static_cast<int64_t>(row) * dim), device_type_);
         Tensor row_logits = allocated_tensor(
             DataType::kDataTypeFp32, {config_->vocab_size_}, allocator);
-        status = qwen3_layers_->cls_layer_->forward(hidden_row, row_logits);
+        status = qwen3_layers_->lm_head_->forward(hidden_row, row_logits);
         if (!status) return status;
         if (device_type_ == DeviceType::kDeviceCUDA) row_logits.to_cpu();
         logits.emplace_back(row_logits.ptr<float>(),

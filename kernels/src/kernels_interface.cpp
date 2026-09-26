@@ -6,8 +6,6 @@
 #include "embed_kernel_cpu.h"
 #include "embed_kernel_cuda.cuh"
 
-#include "mha_kernel_cpu.h"
-#include "mha_kernel_cuda.cuh"
 
 #include "rmsnorm_kernel_cpu.h"
 #include "rmsnorm_kernel_cuda.cuh"
@@ -58,19 +56,6 @@ MatmulKernel get_matmul_kernel(DeviceType device_type)
     }
 }
 
-MatmulKernelQuant get_matmul_kernel_quant8(DeviceType device_type) 
-{
-    if (device_type == DeviceType::kDeviceCUDA)
-    {
-        return matmul_kernel_cu_qint8;
-    } 
-    else 
-    {
-        LOG(FATAL) << "Unknown device type for get an matmul kernel.";
-        return nullptr;
-    }
-}
-
 EmbeddingKernel get_emb_kernel(DeviceType device_type) 
 {
     if (device_type == DeviceType::kDeviceCPU) 
@@ -84,23 +69,6 @@ EmbeddingKernel get_emb_kernel(DeviceType device_type)
     else 
     {
         LOG(FATAL) << "Unknown device type for get an embedding kernel.";
-        return nullptr;
-    }
-}
-
-MHAKernel get_mha_kernel(DeviceType device_type) 
-{
-    if (device_type == DeviceType::kDeviceCPU) 
-    {
-        return mha_kernel;
-    } 
-    else if (device_type == DeviceType::kDeviceCUDA) 
-    {
-        return mha_kernel_cu;
-    } 
-    else 
-    {
-        LOG(FATAL) << "Unknown device type for get an mha kernel.";
         return nullptr;
     }
 }

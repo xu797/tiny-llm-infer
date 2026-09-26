@@ -15,7 +15,7 @@ namespace my_vllm::engine
 struct SchedulerConfig
 {
     int32_t max_num_seqs = 16;
-    int32_t max_num_batched_tokens = 256;
+    int32_t max_num_batched_tokens = 1024;
     int32_t block_size = 16;
     int32_t num_kv_blocks = 128;
 };

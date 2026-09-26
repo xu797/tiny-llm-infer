@@ -13,28 +13,32 @@
 namespace my_vllm
 {
 
-// Qwen3 owns its layer set and inference path. It depends only on the shared
-// Model/layer interfaces, so the Llama2 implementation can be removed without
-// affecting Qwen3.
+// Qwen3 keeps the weights and operations for each decoder block together.
+struct Qwen3DecoderLayer
+{
+    std::shared_ptr<Layer> input_norm_;
+    std::shared_ptr<Layer> q_proj_;
+    std::shared_ptr<Layer> k_proj_;
+    std::shared_ptr<Layer> v_proj_;
+    std::shared_ptr<Layer> o_proj_;
+    std::shared_ptr<Layer> q_norm_;
+    std::shared_ptr<Layer> k_norm_;
+    std::shared_ptr<Layer> post_attention_norm_;
+    std::shared_ptr<Layer> gate_proj_;
+    std::shared_ptr<Layer> up_proj_;
+    std::shared_ptr<Layer> down_proj_;
+};
+
 struct Qwen3Layers
 {
+    std::shared_ptr<Layer> embedding_layer_;
+    std::vector<Qwen3DecoderLayer> decoder_layers_;
+    std::shared_ptr<Layer> final_norm_;
+    std::shared_ptr<Layer> lm_head_;
+
+    // Operators shared by decoder layers.
     std::shared_ptr<Layer> add_layer_;
     std::shared_ptr<Layer> swiglu_layer_;
-    std::shared_ptr<Layer> mha_layer_;
-
-    std::vector<std::shared_ptr<Layer>> wq_layers_;
-    std::vector<std::shared_ptr<Layer>> wk_layers_;
-    std::vector<std::shared_ptr<Layer>> wv_layers_;
-    std::vector<std::shared_ptr<Layer>> wo_layers_;
-    std::vector<std::shared_ptr<Layer>> w1_layers_;
-    std::vector<std::shared_ptr<Layer>> w2_layers_;
-    std::vector<std::shared_ptr<Layer>> w3_layers_;
-    std::vector<std::shared_ptr<Layer>> rmsnorm_layers_;
-    std::vector<std::shared_ptr<Layer>> qnorm_layers_;
-    std::vector<std::shared_ptr<Layer>> knorm_layers_;
-
-    std::shared_ptr<Layer> cls_layer_;
-    std::shared_ptr<Layer> embedding_layer_;
     bool tied_weights_ = false;
 
     void to_cuda(const std::shared_ptr<CudaConfig>& config);
@@ -48,22 +52,16 @@ public:
     ~Qwen3Model() override;
 
     Status init(DeviceType device_type) override;
-    Status predict(const Tensor& input, const Tensor& pos_tensor,
-                   bool is_prompt, int& next) const override;
-    Status forward(const Tensor& input, const Tensor& pos_tensor, int& next) const override;
-    Status generate(const std::string& prompt, int32_t max_new_tokens,
-                    std::string& output);
-
+    Status estimate_paged_kv_cache_blocks(int32_t block_size, int32_t max_batch_tokens,
+                                          float memory_utilization, int32_t& num_blocks) const;
+    size_t paged_kv_cache_size_bytes(int32_t num_blocks, int32_t block_size) const;
     Status configure_paged_kv_cache(int32_t num_blocks, int32_t block_size,
                                     int32_t max_batch_tokens);
-    Status set_paged_block_table(const std::vector<int32_t>& block_table);
-    Status forward_paged_token(int32_t token_id, int32_t position);
     Status forward_paged_batch(const std::vector<int32_t>& token_ids,
                                const std::vector<int32_t>& positions,
                                const std::vector<std::vector<int32_t>>& block_tables,
                                const std::vector<size_t>& sample_rows,
                                std::vector<std::vector<float>>& logits);
-    Status copy_logits_to_host(std::vector<float>& logits) const;
     std::vector<int32_t> tokenize_prompt(const std::string& prompt) const;
     std::string decode_tokens(const std::vector<int32_t>& token_ids) const;
 
@@ -87,26 +85,14 @@ private:
     };
 
     std::vector<int32_t> encode(const std::string& sentence) const override;
-    std::pair<Tensor, Tensor> slice_kv_cache(int32_t layer_idx,
-                                            int32_t token_pos) const override;
-    void create_param_layers() override;
-    void create_nonparam_layers() override;
-    void create_param_quant_layers() override;
-    void init_mem() override;
-    int32_t post_processing(const Tensor& pos, bool is_prompt) const override;
+    void create_param_layers();
+    void create_shared_layers();
+    void init_mem();
 
     Status embedding(const std::vector<int32_t>& tokens, EmbeddingOutput& output) const;
-    Tensor fill_input(const Tensor& pos_tensor, const EmbeddingOutput& embedding_output,
-                      bool is_prompt) const;
-    Status attention_rms(int32_t layer_idx, const Tensor& input) const;
-    Status attention_mha(int32_t layer_idx, const Tensor& pos_tensor) const;
-    Status attention_mha_paged(int32_t layer_idx, int32_t position) const;
-    std::pair<Tensor, Tensor> slice_paged_kv_cache(int32_t layer_idx, int32_t position) const;
-    Status forward_paged(const Tensor& input, const Tensor& pos_tensor) const;
-    Status feed_forward(int32_t layer_idx, const Tensor& input) const;
-    Status cls_logits(const Tensor& input) const;
-
     float* load_weight(const std::string& name, const std::vector<int32_t>& expected_shape);
+    Status read_qwen3_config(ModelConfig& config);
+    Status map_safetensors_file();
     void release_safetensors_map();
 
     int32_t requested_seq_len_ = 2048;
@@ -120,9 +106,6 @@ private:
     int32_t paged_block_size_ = 0;
     int32_t paged_max_batch_tokens_ = 0;
     int32_t paged_max_table_entries_ = 0;
-    Tensor paged_block_table_host_;
-    Tensor paged_block_table_device_;
-    std::vector<int32_t> paged_block_table_ids_;
 
     int safetensors_fd_ = -1;
     void* safetensors_mapping_ = nullptr;

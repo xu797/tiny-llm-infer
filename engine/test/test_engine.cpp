@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -15,6 +16,7 @@
 #include "paged_attention.h"
 #include "qwen3.h"
 #include "qwen3_runner.h"
+#include "rmsnorm.h"
 
 namespace
 {
@@ -163,6 +165,30 @@ public:
 };
 }  // namespace
 
+TEST(Qwen3Tokenizer, ByteLevelUtf8RoundTrip)
+{
+    const std::string tokenizer_path = std::string(MYVLLM_SOURCE_DIR) +
+                                       "/Qwen3-0.6B/tokenizer.json";
+    my_vllm::Qwen3EncodeLayer tokenizer(tokenizer_path);
+    const std::string text = "Hi there! 123\n你好，Qwen3🙂";
+    const auto ids = tokenizer.encode(text);
+    EXPECT_FALSE(ids.empty());
+    EXPECT_EQ(tokenizer.decode(ids), text);
+    EXPECT_EQ(tokenizer.encode("Hi"), (std::vector<int32_t>{13048}));
+}
+
+TEST(Qwen3Tokenizer, AddedChatTokensUseTheirConfiguredIds)
+{
+    const std::string tokenizer_path = std::string(MYVLLM_SOURCE_DIR) +
+                                       "/Qwen3-0.6B/tokenizer.json";
+    my_vllm::Qwen3EncodeLayer tokenizer(tokenizer_path);
+    const auto ids = tokenizer.encode("<|im_start|>user<|im_end|>");
+    ASSERT_GE(ids.size(), 3u);
+    EXPECT_EQ(ids.front(), 151644);
+    EXPECT_EQ(ids.back(), 151645);
+    EXPECT_TRUE(tokenizer.is_sentence_ending(ids.back()));
+}
+
 TEST(EngineBatch, PrefillsMultiplePromptsInOneRunnerCall)
 {
     using namespace my_vllm::engine;
@@ -243,20 +269,12 @@ TEST(Qwen3Engine, RunsVariableLengthPromptsThroughPagedBatchPath)
     const int32_t expected_token = tokenizer.encode("Hi").front();
     const std::filesystem::path directory =
         create_tiny_qwen3_checkpoint(tokenizer.vocab_size(), expected_token);
-    std::string legacy_output;
     {
         my_vllm::Qwen3Model model(tokenizer_path,
                                   (directory / "model.safetensors").string(), 16);
         const my_vllm::Status init_status = model.init(my_vllm::DeviceType::kDeviceCPU);
         ASSERT_TRUE(init_status) << init_status.get_err_msg();
-        const my_vllm::Status generation_status = model.generate("Hi", 1, legacy_output);
-        ASSERT_TRUE(generation_status) << generation_status.get_err_msg();
-    }
-    {
-        my_vllm::Qwen3Model model(tokenizer_path,
-                                  (directory / "model.safetensors").string(), 16);
-        const my_vllm::Status init_status = model.init(my_vllm::DeviceType::kDeviceCPU);
-        ASSERT_TRUE(init_status) << init_status.get_err_msg();
+        EXPECT_EQ(model.paged_kv_cache_size_bytes(3, 2), 96u);
 
         my_vllm::engine::Qwen3ModelRunner runner(model);
         my_vllm::engine::EngineConfig config;
@@ -277,7 +295,7 @@ TEST(Qwen3Engine, RunsVariableLengthPromptsThroughPagedBatchPath)
         ASSERT_TRUE(generation_status) << generation_status.get_err_msg();
         ASSERT_EQ(results.size(), 3u);
         EXPECT_EQ(results[0].token_ids, (std::vector<int32_t>{expected_token}));
-        EXPECT_EQ(results[0].text, legacy_output);
+        EXPECT_EQ(results[0].text, "Hi");
         EXPECT_FALSE(results[1].token_ids.empty());
         EXPECT_FALSE(results[2].token_ids.empty());
     }
@@ -343,6 +361,18 @@ TEST(PagedAttention, FollowsLogicalPagesAndMasksFutureSlots)
     EXPECT_NEAR(output.ptr<float>()[1], 20.f / 3.f, 1e-5f);
 }
 
+TEST(TensorSize, FourDimensionalKVPoolUsesWideProducts)
+{
+    using namespace my_vllm;
+    // This is representative of [layers, pages, block_size, kv_dim] for
+    // a 7B model's FP32 cache and exceeds INT32_MAX elements.
+    Tensor cache(DataType::kDataTypeFp32, 28, 4982, 16, 1024);
+    const size_t expected_elements =
+        size_t{28} * size_t{4982} * size_t{16} * size_t{1024};
+    EXPECT_EQ(cache.size(), expected_elements);
+    EXPECT_EQ(cache.byte_size(), expected_elements * sizeof(float));
+}
+
 TEST(BatchedMatmul, MultipliesEveryTokenRow)
 {
     using namespace my_vllm;
@@ -365,4 +395,31 @@ TEST(BatchedMatmul, MultipliesEveryTokenRow)
     EXPECT_FLOAT_EQ(output.ptr<float>()[1], 2.f);
     EXPECT_FLOAT_EQ(output.ptr<float>()[2], 4.f);
     EXPECT_FLOAT_EQ(output.ptr<float>()[3], 5.f);
+}
+
+
+TEST(test_rmsnorm_cpu, normalizes_each_row_independently)
+{
+    using namespace my_vllm;
+    const auto allocator = CPUDeviceAllocatorFactory::get_instance();
+    Tensor input(DataType::kDataTypeFp32, 2, 3, true, allocator);
+    Tensor weight(DataType::kDataTypeFp32, 3, true, allocator);
+    Tensor output(DataType::kDataTypeFp32, 2, 3, true, allocator);
+    const float values[] = {3.f, 4.f, 0.f, 0.f, 0.f, 2.f};
+    std::copy(values, values + 6, input.ptr<float>());
+    std::fill(weight.ptr<float>(), weight.ptr<float>() + 3, 1.f);
+
+    RmsNormLayer layer(DeviceType::kDeviceCPU, 3);
+    ASSERT_TRUE(layer.set_weight(0, weight));
+    layer.set_input(0, input);
+    layer.set_output(0, output);
+    const Status status = layer.forward();
+    ASSERT_TRUE(status) << status.get_err_msg();
+
+    const float first_scale = 1.f / std::sqrt((25.f / 3.f) + 1e-5f);
+    const float second_scale = 1.f / std::sqrt((4.f / 3.f) + 1e-5f);
+    EXPECT_NEAR(output.ptr<float>()[0], 3.f * first_scale, 1e-5f);
+    EXPECT_NEAR(output.ptr<float>()[1], 4.f * first_scale, 1e-5f);
+    EXPECT_NEAR(output.ptr<float>()[3], 0.f, 1e-5f);
+    EXPECT_NEAR(output.ptr<float>()[5], 2.f * second_scale, 1e-5f);
 }

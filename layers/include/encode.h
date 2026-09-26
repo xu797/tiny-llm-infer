@@ -1,7 +1,6 @@
 #ifndef MYVLLM_LAYERS_ENCODE_H_
 #define MYVLLM_LAYERS_ENCODE_H_
 
-#include <sentencepiece_processor.h>
 #include <unordered_map>
 
 #include "layer.h"
@@ -42,25 +41,6 @@ protected:
     bool has_bos_ = true;
     bool has_eos_ = false;
     std::string token_model_path_;
-};
-
-class SpeEncodeLayer : public EncodeLayerBase 
-{
-public:
-    explicit SpeEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos);
-
-    std::vector<int32_t> encode(const std::string& sentence) const override;
-
-    std::string decode(int32_t token_id) const override;
-
-    std::string decode(const std::vector<int32_t>& token_ids) const override;
-
-    bool is_sentence_ending(int32_t token_id) const override;
-
-    int32_t vocab_size() const override;
-
-private:
-    std::unique_ptr<sentencepiece::SentencePieceProcessor> spe;
 };
 
 #if defined (LLAMA3_SUPPORT) || defined (QWEN2_SUPPORT)

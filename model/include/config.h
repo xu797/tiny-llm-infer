@@ -27,7 +27,6 @@ struct TransformerConfig
     int32_t head_num_ = 0;
     int32_t kv_head_num_ = 0;
     int32_t seq_len_ = 0;
-    bool is_shared_weight_ = false;
 };
 }  // namespace my_vllm
 #endif  // MYVLLM_MODEL_CONFIG_H_
