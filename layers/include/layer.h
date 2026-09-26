@@ -20,7 +20,6 @@ enum class LayerType : uint8_t
     kLayerRMSNorm = 4,
     kLayerMatmul = 5,
     kLayerRoPe = 6,
-    kLayerMHA = 7,
     kLayerSoftmax = 8,
     kLayerAdd = 9,
     kLayerSwiGLU = 10,
@@ -163,7 +162,7 @@ class LayerParam : public Layer
 {
 public:
     explicit LayerParam(DeviceType device_type, LayerType layer_type,
-                        bool is_quant_layer = false, std::string layer_name = "");
+                        std::string layer_name = "");
 
     size_t weight_size() const;
 
@@ -180,16 +179,7 @@ public:
     Status set_weight(int32_t idx, const std::vector<int32_t>& dims, const void* weight_ptr,
                             DeviceType device_type = DeviceType::kDeviceUnknown) override;
 
-    void set_scales(const Tensor& scales);
-
-    void set_group_size(int32_t group_size);
-
-    int32_t get_scale_num() const;
-
 protected:
-    int32_t group_size_ = 0;
-    bool is_quant_layer_ = false;
-    Tensor scales_;
     std::vector<Tensor> weights_;
 };
 

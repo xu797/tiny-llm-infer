@@ -14,6 +14,7 @@ endif ()
 set(link_math_lib ${ARMADILLO_LIBRARIES} ${BLAS_LIBRARIES} ${LAPACK_LIBRARIES})
 
 aux_source_directory(./test DIR_TEST_ARMA)
+aux_source_directory(${PROJECT_SOURCE_DIR}/engine/test ENGINE_TEST_SRC)
 aux_source_directory(./src DIR_SOURCE_ARMA)
 aux_source_directory(${PROJECT_SOURCE_DIR}/memory/src MEMORY_SRC)
 aux_source_directory(${PROJECT_SOURCE_DIR}/utils/src UTILS_SRC)
@@ -22,9 +23,9 @@ aux_source_directory(${PROJECT_SOURCE_DIR}/kernels/src KERNELS_CPP_SRC)
 aux_source_directory(${PROJECT_SOURCE_DIR}/layers/src LAYERS_SRC)
 file(GLOB KERNELS_CU_SRC "${PROJECT_SOURCE_DIR}/kernels/src/*.cu")
 
-add_executable(model_main model_main.cpp ${DIR_TEST_ARMA} ${DIR_SOURCE_ARMA} ${MEMORY_SRC} ${UTILS_SRC} ${TENSOR_SRC} ${KERNELS_CPP_SRC} ${KERNELS_CU_SRC} ${LAYERS_SRC})  
+add_executable(model_main model_main.cpp ${DIR_TEST_ARMA} ${ENGINE_TEST_SRC} ${DIR_SOURCE_ARMA} ${MEMORY_SRC} ${UTILS_SRC} ${TENSOR_SRC} ${KERNELS_CPP_SRC} ${KERNELS_CU_SRC} ${LAYERS_SRC})
 # target_link_libraries(model_main ${link_lib} ${link_math_lib} OpenMP::OpenMP_CXX CUDA::cudart)
-target_link_libraries(model_main ${link_lib} ${link_math_lib} OpenMP::OpenMP_CXX CUDA::cudart sentencepiece)
+target_link_libraries(model_main ${link_lib} ${link_math_lib} OpenMP::OpenMP_CXX CUDA::cudart)
 
 
 target_include_directories(model_main PUBLIC ${glog_INCLUDE_DIR})

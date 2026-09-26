@@ -20,6 +20,11 @@ void qwen3_rope_kernel_cu(int32_t query_heads, int32_t kv_heads, int32_t head_si
                           const Tensor& input_q, const Tensor& input_k,
                           const Tensor& input_pos, const Tensor& sin_cache,
                           const Tensor& cos_cache, void* stream);
+void qwen3_rope_batch_kernel_cu(int32_t rows, int32_t query_heads, int32_t kv_heads,
+                                int32_t head_size, const Tensor& input_q,
+                                const Tensor& input_k, const Tensor& positions,
+                                const Tensor& sin_cache, const Tensor& cos_cache,
+                                void* stream);
 
 }  
 #endif  // MYVLLM_KERNELS_ROPE_CUDA_H_

@@ -12,27 +12,14 @@
 
 namespace  my_vllm 
 {
-enum class ModelBufferType 
+enum class ModelBufferType
 {
     kInputTokens = 0,
     kInputEmbeddings = 1,
-    kOutputRMSNorm = 2,
-    kKeyCache = 3,
-    kValueCache = 4,
-    kQuery = 5,
-    kInputPos = 6,
-    kScoreStorage = 7,
-    kOutputMHA = 8,
-    kAttnOutput = 9,
-    kW1Output = 10,
-    kW2Output = 11,
-    kW3Output = 12,
-    kFFNRMSNorm = 13,
-    kForwardOutput = 15,
-    kForwardOutputCPU = 16,
-
-    kSinCache = 17,
-    kCosCache = 18,
+    kKeyCache = 2,
+    kValueCache = 3,
+    kSinCache = 4,
+    kCosCache = 5,
 };
 
 enum class DeviceType : uint8_t 
@@ -46,15 +33,13 @@ enum class DataType : uint8_t
 {
     kDataTypeUnknown = 0,
     kDataTypeFp32 = 1,
-    kDataTypeInt8 = 2,
-    kDataTypeInt32 = 3,
+    kDataTypeInt32 = 2,
 };
 
 enum class ModelType : uint8_t 
 {
     kModelTypeUnknown = 0,
-    kModelTypeLLama2 = 1,
-    kModelTypeQwen3 = 2,
+    kModelTypeQwen3 = 1,
 };  
 
 inline size_t DataTypeSize(DataType data_type) 
@@ -62,10 +47,6 @@ inline size_t DataTypeSize(DataType data_type)
     if (data_type == DataType::kDataTypeFp32) 
     {
         return sizeof(float);
-    } 
-    else if (data_type == DataType::kDataTypeInt8) 
-    {
-        return sizeof(int8_t);
     } 
     else if (data_type == DataType::kDataTypeInt32) 
     {
@@ -100,12 +81,7 @@ enum StatusCode : uint8_t
     kInvalidArgument = 7,
 };
 
-enum class TokenizerType 
-{
-    kEncodeUnknown = -1,
-    kEncodeSpe = 0,
-    kEncodeBpe = 1,
-};
+
 
 class Status 
 {

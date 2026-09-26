@@ -8,7 +8,7 @@
 namespace my_vllm
 {
 RmsNormLayer::RmsNormLayer(DeviceType device_type, int32_t dim, float eps)
-    : LayerParam(device_type, LayerType::kLayerRMSNorm, false, "RMSNorm"), dim_(dim), eps_(eps)
+    : LayerParam(device_type, LayerType::kLayerRMSNorm, "RMSNorm"), dim_(dim), eps_(eps)
 {
     reset_input_size(1);
     reset_output_size(1);

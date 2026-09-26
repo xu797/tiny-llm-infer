@@ -23,7 +23,7 @@ file(GLOB KERNELS_CU_SRC "${PROJECT_SOURCE_DIR}/kernels/src/*.cu")
 
 add_executable(layers_main layers_main.cpp ${DIR_TEST_ARMA} ${DIR_SOURCE_ARMA} ${MEMORY_SRC} ${UTILS_SRC} ${TENSOR_SRC} ${KERNELS_CPP_SRC} ${KERNELS_CU_SRC})  
 # target_link_libraries(layers_main ${link_lib} ${link_math_lib} OpenMP::OpenMP_CXX CUDA::cudart)
-target_link_libraries(layers_main ${link_lib} ${link_math_lib} OpenMP::OpenMP_CXX CUDA::cudart sentencepiece)
+target_link_libraries(layers_main ${link_lib} ${link_math_lib} OpenMP::OpenMP_CXX CUDA::cudart)
 
 
 target_include_directories(layers_main PUBLIC ${glog_INCLUDE_DIR})

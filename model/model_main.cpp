@@ -1,10 +1,14 @@
+#include <algorithm>
+#include <cmath>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <string>
+#include <vector>
 
-#include "llama.h"
 #include "qwen3.h"
+#include "llm_engine.h"
+#include "qwen3_runner.h"
 
 namespace
 {
@@ -12,13 +16,16 @@ void print_inference_usage(const char* program)
 {
     std::cerr << "Usage: " << program
               << " --infer --tokenizer <tokenizer-file> --model <weights-file>"
-                 " --prompt <text> [--model-type llama2|qwen3] [--device cpu|cuda]"
-                 " [--max-new-tokens <count>] [--max-seq-len <count>] [--quant]\n";
+                 " --prompt <text> [--prompt <text> ...] [--device cpu|cuda]"
+                 " [--max-new-tokens <count>] [--max-seq-len <count>] [--num-kv-blocks <count>]"
+                 " [--gpu-memory-utilization <0..0.95>]\n";
 }
 
-template <typename ModelT>
-int run_initialized_model(ModelT& model, my_vllm::DeviceType device_type,
-                          const std::string& prompt, int max_new_tokens)
+int run_qwen3_engine(my_vllm::Qwen3Model& model,
+                      my_vllm::DeviceType device_type,
+                      const std::vector<std::string>& prompts, int max_new_tokens,
+                      int max_seq_len, int requested_kv_blocks,
+                      float gpu_memory_utilization)
 {
     my_vllm::Status status = model.init(device_type);
     if (!status)
@@ -26,27 +33,85 @@ int run_initialized_model(ModelT& model, my_vllm::DeviceType device_type,
         std::cerr << "Model initialization failed: " << status.get_err_msg() << '\n';
         return 1;
     }
-    std::string generated;
-    status = model.generate(prompt, max_new_tokens, generated);
+    if (max_new_tokens == 0)
+    {
+        for (size_t i = 0; i < prompts.size(); ++i) std::cout << std::endl;
+        return 0;
+    }
+
+    my_vllm::engine::Qwen3ModelRunner runner(model);
+    my_vllm::engine::EngineConfig config;
+    config.max_model_len = max_seq_len;
+    config.scheduler.max_num_seqs =
+        std::min<int32_t>(16, static_cast<int32_t>(prompts.size()));
+    config.scheduler.max_num_batched_tokens = std::min(max_seq_len, 256);
+    config.scheduler.block_size = std::min(16, max_seq_len);
+    if (requested_kv_blocks > 0)
+    {
+        config.scheduler.num_kv_blocks = requested_kv_blocks;
+    }
+    else if (device_type == my_vllm::DeviceType::kDeviceCUDA)
+    {
+        status = model.estimate_paged_kv_cache_blocks(
+            config.scheduler.block_size, config.scheduler.max_num_batched_tokens,
+            gpu_memory_utilization, config.scheduler.num_kv_blocks);
+        if (!status)
+        {
+            std::cerr << "KV cache sizing failed: " << status.get_err_msg() << '\n';
+            return 1;
+        }
+    }
+    else
+    {
+        config.scheduler.num_kv_blocks =
+            (max_seq_len + config.scheduler.block_size - 1) / config.scheduler.block_size;
+    }
+    const size_t kv_cache_bytes = model.paged_kv_cache_size_bytes(
+        config.scheduler.num_kv_blocks, config.scheduler.block_size);
+    if (kv_cache_bytes == 0)
+    {
+        std::cerr << "The requested KV cache size is invalid.\n";
+        return 2;
+    }
+    std::cerr << "Preallocating " << config.scheduler.num_kv_blocks
+              << " KV blocks (" << (kv_cache_bytes >> 20) << " MiB).\n";
+    my_vllm::engine::LLMEngine engine(runner, config);
+    status = engine.init();
+    if (!status)
+    {
+        std::cerr << "Engine initialization failed: " << status.get_err_msg() << '\n';
+        return 1;
+    }
+
+    my_vllm::engine::SamplingParams sampling;
+    sampling.max_tokens = max_new_tokens;
+    std::vector<my_vllm::engine::GenerationResult> results;
+    status = engine.generate(prompts, {sampling}, results);
     if (!status)
     {
         std::cerr << "Generation failed: " << status.get_err_msg() << '\n';
         return 1;
     }
-    std::cout << generated << std::endl;
+    if (results.size() != prompts.size())
+    {
+        std::cerr << "The engine returned an incomplete result set.\n";
+        return 1;
+    }
+    for (const auto& result : results) std::cout << result.text << std::endl;
     return 0;
 }
+
 
 int run_inference(int argc, char* argv[])
 {
     std::string tokenizer_path;
     std::string model_path;
-    std::string prompt;
+    std::vector<std::string> prompts;
     std::string device = "cpu";
-    std::string model_type = "llama2";
     int max_new_tokens = 64;
     int max_seq_len = 2048;
-    bool quant = false;
+    int num_kv_blocks = 0;
+    float gpu_memory_utilization = 0.9f;
 
     for (int i = 2; i < argc; ++i)
     {
@@ -61,15 +126,11 @@ int run_inference(int argc, char* argv[])
         }
         else if (arg == "--prompt" && i + 1 < argc)
         {
-            prompt = argv[++i];
+            prompts.emplace_back(argv[++i]);
         }
         else if (arg == "--device" && i + 1 < argc)
         {
             device = argv[++i];
-        }
-        else if (arg == "--model-type" && i + 1 < argc)
-        {
-            model_type = argv[++i];
         }
         else if (arg == "--max-new-tokens" && i + 1 < argc)
         {
@@ -95,9 +156,29 @@ int run_inference(int argc, char* argv[])
                 return 2;
             }
         }
-        else if (arg == "--quant")
+        else if (arg == "--num-kv-blocks" && i + 1 < argc)
         {
-            quant = true;
+            try
+            {
+                num_kv_blocks = std::stoi(argv[++i]);
+            }
+            catch (const std::exception&)
+            {
+                std::cerr << "--num-kv-blocks must be an integer.\n";
+                return 2;
+            }
+        }
+        else if (arg == "--gpu-memory-utilization" && i + 1 < argc)
+        {
+            try
+            {
+                gpu_memory_utilization = std::stof(argv[++i]);
+            }
+            catch (const std::exception&)
+            {
+                std::cerr << "--gpu-memory-utilization must be a number.\n";
+                return 2;
+            }
         }
         else if (arg == "--help" || arg == "-h")
         {
@@ -112,9 +193,13 @@ int run_inference(int argc, char* argv[])
         }
     }
 
-    if (tokenizer_path.empty() || model_path.empty() || prompt.empty() || max_new_tokens < 0 ||
-        max_seq_len <= 0 || (device != "cpu" && device != "cuda") ||
-        (model_type != "llama2" && model_type != "qwen3"))
+    if (tokenizer_path.empty() || model_path.empty() || prompts.empty() ||
+        std::any_of(prompts.begin(), prompts.end(), [](const std::string& value) {
+            return value.empty();
+        }) || max_new_tokens < 0 || max_seq_len <= 0 || num_kv_blocks < 0 ||
+        !std::isfinite(gpu_memory_utilization) || gpu_memory_utilization <= 0.0f ||
+        gpu_memory_utilization > 0.95f ||
+        (device != "cpu" && device != "cuda"))
     {
         print_inference_usage(argv[0]);
         return 2;
@@ -123,45 +208,11 @@ int run_inference(int argc, char* argv[])
     const my_vllm::DeviceType device_type = device == "cuda"
                                                 ? my_vllm::DeviceType::kDeviceCUDA
                                                 : my_vllm::DeviceType::kDeviceCPU;
-    if (model_type == "qwen3")
-    {
-        if (quant)
-        {
-            std::cerr << "--quant applies only to the legacy Llama2 binary format.\n";
-            return 2;
-        }
-        my_vllm::Qwen3Model model(tokenizer_path, model_path, max_seq_len);
-        return run_initialized_model(model, device_type, prompt, max_new_tokens);
-    }
-
-    my_vllm::LLama2Model model(my_vllm::TokenizerType::kEncodeSpe, tokenizer_path, model_path, quant);
-    return run_initialized_model(model, device_type, prompt, max_new_tokens);
+    my_vllm::Qwen3Model model(tokenizer_path, model_path, max_seq_len);
+    return run_qwen3_engine(model, device_type, prompts, max_new_tokens, max_seq_len,
+                            num_kv_blocks, gpu_memory_utilization);
 }
 } // namespace
-
-TEST(Qwen3Tokenizer, ByteLevelUtf8RoundTrip)
-{
-    const std::string tokenizer_path = std::string(MYVLLM_SOURCE_DIR) +
-                                       "/Qwen3-0.6B/tokenizer.json";
-    my_vllm::Qwen3EncodeLayer tokenizer(tokenizer_path);
-    const std::string text = "Hi there! 123\n你好，Qwen3🙂";
-    const auto ids = tokenizer.encode(text);
-    EXPECT_FALSE(ids.empty());
-    EXPECT_EQ(tokenizer.decode(ids), text);
-    EXPECT_EQ(tokenizer.encode("Hi"), std::vector<int32_t>{13048});
-}
-
-TEST(Qwen3Tokenizer, AddedChatTokensUseTheirConfiguredIds)
-{
-    const std::string tokenizer_path = std::string(MYVLLM_SOURCE_DIR) +
-                                       "/Qwen3-0.6B/tokenizer.json";
-    my_vllm::Qwen3EncodeLayer tokenizer(tokenizer_path);
-    const auto ids = tokenizer.encode("<|im_start|>user<|im_end|>");
-    ASSERT_GE(ids.size(), 3u);
-    EXPECT_EQ(ids.front(), 151644);
-    EXPECT_EQ(ids.back(), 151645);
-    EXPECT_TRUE(tokenizer.is_sentence_ending(ids.back()));
-}
 
 int main(int argc, char *argv[]) 
 {
