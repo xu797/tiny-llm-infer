@@ -14,24 +14,16 @@ SwiGLULayer::SwiGLULayer(DeviceType device_type, int32_t hidden_dim)
 
 Status SwiGLULayer::check() const
 {
-    Status status;
-    const int32_t input_tensor_num = 2;
-    for (int32_t i = 0; i < input_tensor_num; ++i) 
-    {
-        status = check_tensor_with_dim(get_input(0), device_type_, data_type_, hidden_dim_);
-        if (!status) 
-        {
-            LOG(ERROR) << "The input tensor " << std::to_string(i) << " error in the swiglu layer.";
-            return status;
-        }
-    }
-
-    status = check_tensor_with_dim(get_output(0), device_type_, data_type_, hidden_dim_);
-    if (!status) 
-    {
-        LOG(ERROR) << "The output tensor error in the swiglu layer.";
-        return status;
-    }
+    const Tensor& gate = get_input(0);
+    const Tensor& up = get_input(1);
+    const Tensor& output = get_output(0);
+    if (gate.is_empty() || up.is_empty() || output.is_empty() ||
+        gate.device_type() != device_type_ || up.device_type() != device_type_ ||
+        output.device_type() != device_type_ || gate.data_type() != data_type_ ||
+        up.data_type() != data_type_ || output.data_type() != data_type_ ||
+        gate.dims() != up.dims() || gate.dims() != output.dims() ||
+        gate.dims_size() == 0 || gate.get_dim(gate.dims_size() - 1) != hidden_dim_)
+        return InvalidArgument("The SwiGLU tensors must share a shape ending in hidden_dim.");
     return Success();
 }
 

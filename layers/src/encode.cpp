@@ -10,54 +10,6 @@
 namespace my_vllm
 {
 
-SpeEncodeLayer::SpeEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos)
-    : EncodeLayerBase(std::move(token_model_path), has_bos, has_eos) 
-{
-    spe = std::make_unique<sentencepiece::SentencePieceProcessor>();
-    spe->Load(token_model_path_);
-}
-
-std::string SpeEncodeLayer::decode(int32_t token_id) const 
-{
-    CHECK(spe != nullptr);
-    std::vector<int32_t> token_ids{token_id};
-    return this->spe->DecodeIds(token_ids);
-}
-
-std::string SpeEncodeLayer::decode(const std::vector<int32_t>& token_ids) const
-{
-    CHECK(spe != nullptr);
-    return this->spe->DecodeIds(token_ids);
-}
-
-std::vector<int32_t> SpeEncodeLayer::encode(const std::string& sentence) const 
-{
-    CHECK(spe != nullptr);
-    // sentencepiece
-    std::vector<int32_t> input_ids = spe->EncodeAsIds(sentence);
-    if (has_bos_) 
-    {
-        input_ids.insert(input_ids.begin(), spe->bos_id());
-    }
-    if (has_eos_) 
-    {
-        input_ids.push_back(spe->eos_id());
-    }
-    return input_ids;
-}
-
-bool SpeEncodeLayer::is_sentence_ending(int32_t token_id) const 
-{
-    CHECK(this->spe != nullptr);
-    return token_id == this->spe->eos_id();
-}
-
-int32_t SpeEncodeLayer::vocab_size() const 
-{
-    CHECK(spe != nullptr);
-    return spe->GetPieceSize();
-}
-
 #if defined (LLAMA3_SUPPORT) || defined (QWEN2_SUPPORT)
 static const std::string PAT_STR =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?:$|[^\S])|\s+)";

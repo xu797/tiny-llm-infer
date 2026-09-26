@@ -219,8 +219,8 @@ size_t Layer::output_size() const
     return outputs_.size();
 }
 
-LayerParam::LayerParam(DeviceType device_type, LayerType layer_type, bool is_quant_layer, std::string layer_name)
-    : Layer(device_type, layer_type, std::move(layer_name)), is_quant_layer_(is_quant_layer)
+LayerParam::LayerParam(DeviceType device_type, LayerType layer_type, std::string layer_name)
+    : Layer(device_type, layer_type, std::move(layer_name))
 {
 
 }
@@ -252,10 +252,6 @@ void LayerParam::to_cuda()
     {
         weight.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
     }
-    if (!scales_.is_empty())
-    {
-        scales_.to_cuda(cuda_config_ ? cuda_config_->stream : nullptr);
-    }
 }
 
 Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims, const void* weight_ptr, DeviceType device_type)
@@ -271,49 +267,12 @@ Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims, con
         buffer->set_device_type(device_type);
     }
 
-    if (!is_quant_layer_)
-    {
-        Tensor weight(DataType::kDataTypeFp32, dims);
-        weight.set_device_type(device_type);
-        CHECK(weight.assign(buffer));
-        weights_.at(idx) = weight;
-    }
-    else
-    {
-        // is quant layer
-        Tensor weight(DataType::kDataTypeInt8, dims);
-        weight.set_device_type(device_type);
-        CHECK(weight.assign(buffer));
-        weights_.at(idx) = weight;
-
-        const int32_t weight_size = static_cast<int32_t>(weight.size());
-        CHECK(weight_size % group_size_ == 0);
-
-        int32_t scale_nums = weight_size / group_size_;
-        scales_ = Tensor{DataType::kDataTypeFp32, scale_nums, false, nullptr,
-                                    reinterpret_cast<float*>((int8_t*)weight_ptr + weight_size)};
-        scales_.set_device_type(device_type);
-    }
+    Tensor weight(DataType::kDataTypeFp32, dims);
+    weight.set_device_type(device_type);
+    CHECK(weight.assign(buffer));
+    weights_.at(idx) = weight;
 
     return Success();
-}
-
-void LayerParam::set_scales(const Tensor& scales)
-{
-    CHECK(!scales.is_empty());
-    this->scales_ = scales;
-}
-
-void LayerParam::set_group_size(int32_t group_size)
-{
-    this->group_size_ = group_size;
-}
-
-
-int32_t LayerParam::get_scale_num() const
-{
-    CHECK(!scales_.is_empty());
-    return static_cast<int32_t>(scales_.size());
 }
 
 void LayerParam::reset_weight_size(size_t size)

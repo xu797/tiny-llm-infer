@@ -1,18 +1,34 @@
 #include "tensor.h"
+
+#include <limits>
 #include "cuda_alloc.h"
 #include "cpu_alloc.h"
 
 namespace my_vllm
 {
 
-template <typename T, typename Tp>
-static size_t reduce_dimension(T begin, T end, Tp init)
+template <typename T>
+static size_t reduce_dimension(T begin, T end, size_t init)
 {
-    if (begin >= end) 
+    if (begin >= end)
     {
         return 0;
     }
-    size_t size = std::accumulate(begin, end, init, std::multiplies<>());
+
+    size_t size = init;
+    for (T dimension = begin; dimension != end; ++dimension)
+    {
+        if (*dimension <= 0)
+        {
+            return 0;
+        }
+        const size_t value = static_cast<size_t>(*dimension);
+        if (size > std::numeric_limits<size_t>::max() / value)
+        {
+            return 0;
+        }
+        size *= value;
+    }
     return size;
 }
 
@@ -20,7 +36,7 @@ Tensor::Tensor(DataType data_type, int32_t dim0, bool need_alloc, std::shared_pt
         : data_type_(data_type)
 {
     dims_.push_back(dim0);
-    size_ = dim0;
+    size_ = reduce_dimension(dims_.begin(), dims_.end(), size_t{1});
     if (need_alloc && alloc) 
     {
         allocate(alloc);
@@ -42,7 +58,7 @@ Tensor::Tensor(
 {
     dims_.push_back(dim0);
     dims_.push_back(dim1);
-    size_ = dim0 * dim1;
+    size_ = reduce_dimension(dims_.begin(), dims_.end(), size_t{1});
     if (need_alloc && alloc)
     {
         allocate(alloc);
@@ -61,7 +77,7 @@ Tensor::Tensor(
     dims_.push_back(dim0);
     dims_.push_back(dim1);
     dims_.push_back(dim2);
-    size_ = dim0 * dim1 * dim2;
+    size_ = reduce_dimension(dims_.begin(), dims_.end(), size_t{1});
     if (need_alloc && alloc) 
     {
         allocate(alloc);
@@ -81,7 +97,7 @@ Tensor::Tensor(
     dims_.push_back(dim1);
     dims_.push_back(dim2);
     dims_.push_back(dim3);
-    size_ = dim0 * dim1 * dim2 * dim3;
+    size_ = reduce_dimension(dims_.begin(), dims_.end(), size_t{1});
     if (need_alloc && alloc)
     {
         allocate(alloc);
@@ -97,7 +113,7 @@ Tensor::Tensor(
     std::shared_ptr<DeviceAllocator> alloc, void *ptr)
     : dims_(std::move(dims)), data_type_(data_type)
 {
-    size_ = reduce_dimension(dims_.begin(), dims_.end(), 1);
+    size_ = reduce_dimension(dims_.begin(), dims_.end(), size_t{1});
     if (need_alloc && alloc) 
     {
         allocate(alloc);
@@ -197,10 +213,6 @@ static size_t data_type_size(DataType data_type)
         {
             return 4;
         }
-        case DataType::kDataTypeInt8: 
-        {
-            return 1;
-        }
         case DataType::kDataTypeInt32: 
         {
             return 4;
@@ -228,7 +240,7 @@ void Tensor::init_buffer(std::shared_ptr<DeviceAllocator> alloc, DataType data_t
 
 void Tensor::reshape(const std::vector<int32_t>& dims) 
 {
-    size_t size = reduce_dimension(dims.begin(), dims.end(), 1);
+    size_t size = reduce_dimension(dims.begin(), dims.end(), size_t{1});
     if (!buffer_)
     {
         this->dims_ = dims;
