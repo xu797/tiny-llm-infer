@@ -17,3 +17,6 @@ build/
 llama2/
 
 Qwen3-0.6B/
+
+**/test/
+tools/
