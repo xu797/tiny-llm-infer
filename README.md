@@ -51,12 +51,3 @@ On CUDA, the CLI estimates num_blocks from the free VRAM after loading the model
 
 On CPU, the default pool is sized to hold one sequence up to --max-seq-len.
 
-cmake --build build -j2
-
-./build/model/model_main --infer \
-  --tokenizer Qwen3-0.6B/tokenizer.json \
-  --model Qwen3-0.6B/model.safetensors \
-  --prompt $'<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n' \
-  --prompt $'<|im_start|>user\nintroduce qwen3 model.<|im_end|>\n<|im_start|>assistant\n' \
-  --device cuda --max-seq-len 2048 --max-new-tokens 1024
-
