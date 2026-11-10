@@ -13,11 +13,11 @@ Run the C++ and CUDA tests with:
 
     ctest --test-dir build --output-on-failure
 
-## Model Files
+<!-- ## Model Files
 
 The examples use `Qwen2.5-3B-Instruct`. The model directory must contain the Hugging Face configuration and safetensors checkpoint files; pass the tokenizer JSON separately with `--tokenizer`. Single-file and indexed/sharded safetensors checkpoints are supported.
 
-The runtime stores weights, activations, and KV cache in FP16. BF16 checkpoint weights are converted to FP16 during loading. CUDA projection layers use cuBLAS FP16 GEMM; attention and normalization reductions accumulate in FP32.
+The runtime stores weights, activations, and KV cache in FP16. BF16 checkpoint weights are converted to FP16 during loading. CUDA projection layers use cuBLAS FP16 GEMM; attention and normalization reductions accumulate in FP32. -->
 
 ## Qwen2.5 inference
 
@@ -39,9 +39,9 @@ Pass --prompt more than once to submit a batch:
 
 The CLI treats each prompt as text to continue; it does not apply tokenizer_config.json's chat template automatically. For instruction-style replies, include the model's chat markers in the prompt. Use `--device cpu` for CPU inference. Active sequences are decoded together. Prompt prefill processes multiple tokens per step and can be chunked to fit the scheduler token budget.
 
-## Continuous batching
+<!-- ## Continuous batching
 
-`LLMEngine` supports online request submission: call `add_request()` while the engine is serving, then repeatedly call `step()`. The scheduler places active decode tokens first and uses the remaining token budget for newly arrived prompt prefill, so both phases can run in one model batch. Completed requests are returned by `step()`. Submit requests from another thread if arrivals happen during a model step; keep one thread responsible for calling `step()`.
+`LLMEngine` supports online request submission: call `add_request()` while the engine is serving, then repeatedly call `step()`. The scheduler places active decode tokens first and uses the remaining token budget for newly arrived prompt prefill, so both phases can run in one model batch. Completed requests are returned by `step()`. Submit requests from another thread if arrivals happen during a model step; keep one thread responsible for calling `step()`. -->
 
 ## Benchmarking
 
@@ -54,7 +54,7 @@ The current matrix contains batch sizes 1, 8, and 32 with 128-token prompts and 
 Set `MANIFEST_DIR` to save each measured repeat's exact prompt token IDs and sampling parameters. These manifests let the vLLM script run the same requests:
 
     MANIFEST_DIR=/tmp/tiny-vllm-manifests \
-      ./benchmark/run_quantization_matrix.sh > tiny.csv
+      ./benchmark/run_benchmark.sh > tiny.csv
 
 ### vLLM Comparison
 
@@ -85,15 +85,16 @@ Eager mode disables CUDA Graphs and `torch.compile`, so the difference from defa
 
 Measured on an RTX 3090 (24 GB) with Qwen2.5-3B-Instruct, FP16 runtime, batch sizes 1/8/32, 128-token prompts, and 128 generated tokens per request. All runs used random sampling, EOS ignored, 3 warmups, and 5 measured repeats; table values are median aggregate output tokens/s. TinyLLM and both vLLM modes used the same per-repeat prompt manifests. The vLLM eager result disables both CUDA Graphs and `torch.compile`.
 
-| Batch size | TinyLLM | vLLM default | vLLM eager |
+| Batch size | TinyLLM | vLLM eager | vLLM default |
 | ---: | ---: | ---: | ---: |
-| 1 | 85.79 | 113.29 | 68.93 |
-| 8 | 560.61 | 725.48 | 494.47 |
-| 32 | 1482.61 | 2183.71 | 1619.73 |
+| 1 | 85.79 | 68.93 | 113.29 |
+| 8 | 560.61 | 494.47 | 725.48 |
+| 32 | 1482.61 | 1619.73 | 2183.71 |
+
 
 These are measured results for this hardware, model, and workload, not a general performance guarantee. CUDA Graphs and compilation make a substantial difference to vLLM's decode throughput in these tests.
 
-## Model layout
+<!-- ## Model layout
 
 - model/src/qwen3_checkpoint.cpp reads Qwen2/Qwen3 configuration and maps single-file or sharded Safetensors.
 - model/src/qwen3_layers.cpp converts checkpoint tensors and builds the embedding, decoder layers, final norm, and LM head.
@@ -113,5 +114,5 @@ For the current FP16 cache, the pool size is:
 
 On CUDA, the CLI estimates num_blocks from the free VRAM after loading the model. --gpu-memory-utilization controls the target fraction of total GPU memory and defaults to 0.9; the estimator leaves additional room for workspaces. Set --num-kv-blocks N to choose a fixed pool size.
 
-On CPU, the default pool is sized to hold one sequence up to --max-seq-len.
+On CPU, the default pool is sized to hold one sequence up to --max-seq-len. -->
 
