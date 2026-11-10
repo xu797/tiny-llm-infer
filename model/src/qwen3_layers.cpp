@@ -11,6 +11,7 @@
 #include "matmul.h"
 #include "rmsnorm.h"
 #include "swiglu.h"
+#include "fp16.h"
 
 namespace my_vllm
 {
@@ -72,8 +73,8 @@ void Qwen3Layers::to_cuda(const std::shared_ptr<CudaConfig>& config)
     }
 }
 
-float* Qwen3Model::load_weight(const std::string& name,
-                               const std::vector<int32_t>& expected_shape)
+uint16_t* Qwen3Model::load_weight(const std::string& name,
+                                  const std::vector<int32_t>& expected_shape)
 {
     const auto found = safetensors_.find(name);
     if (found == safetensors_.end())
@@ -96,7 +97,8 @@ float* Qwen3Model::load_weight(const std::string& name,
         return nullptr;
     }
 
-    const size_t element_size = info.dtype == "BF16" ? 2 : (info.dtype == "F32" ? 4 : 0);
+    const size_t element_size = (info.dtype == "BF16" || info.dtype == "F16")
+                                   ? 2 : (info.dtype == "F32" ? 4 : 0);
     if (element_size == 0 || info.end < info.begin ||
         info.end - info.begin != count * element_size)
     {
@@ -105,25 +107,41 @@ float* Qwen3Model::load_weight(const std::string& name,
         return nullptr;
     }
 
-    std::unique_ptr<float[]> converted(new float[count]);
-    const uint8_t* source = static_cast<const uint8_t*>(safetensors_mapping_) +
-                            safetensors_data_start_ + info.begin;
+    std::unique_ptr<uint16_t[]> converted(new uint16_t[count]);
+    const auto mapping = safetensors_maps_.at(info.filename).second;
+    const uint8_t* source = static_cast<const uint8_t*>(mapping) + info.data_start + info.begin;
     if (info.dtype == "BF16")
     {
         for (size_t i = 0; i < count; ++i)
         {
-            uint16_t bf16;
-            std::memcpy(&bf16, source + i * sizeof(uint16_t), sizeof(uint16_t));
-            const uint32_t bits = static_cast<uint32_t>(bf16) << 16;
-            std::memcpy(converted.get() + i, &bits, sizeof(float));
+            uint16_t value;
+            std::memcpy(&value, source + i * sizeof(uint16_t), sizeof(uint16_t));
+            if (info.dtype == "BF16")
+            {
+                const uint32_t bits = static_cast<uint32_t>(value) << 16;
+                float as_float;
+                std::memcpy(&as_float, &bits, sizeof(as_float));
+                converted[i] = float_to_fp16(as_float);
+            }
+            else converted[i] = value;
         }
+    }
+    else if (info.dtype == "F16")
+    {
+        for (size_t i = 0; i < count; ++i)
+            std::memcpy(&converted[i], source + i * sizeof(uint16_t), sizeof(uint16_t));
     }
     else
     {
-        std::memcpy(converted.get(), source, count * sizeof(float));
+        for (size_t i = 0; i < count; ++i)
+        {
+            float value;
+            std::memcpy(&value, source + i * sizeof(float), sizeof(value));
+            converted[i] = float_to_fp16(value);
+        }
     }
 
-    float* result = converted.get();
+    uint16_t* result = converted.get();
     weight_storage_.push_back(std::move(converted));
     return result;
 }
@@ -142,23 +160,51 @@ void Qwen3Model::create_param_layers()
 
     const auto create_projection = [this, host](const std::string& name,
                                                 int32_t output_dim,
-                                                int32_t input_dim) -> std::shared_ptr<Layer> {
-        float* weights = load_weight(name, {output_dim, input_dim});
+                                                int32_t input_dim,
+                                                bool has_bias = false) -> std::shared_ptr<Layer> {
+        uint16_t* weights = load_weight(name, {output_dim, input_dim});
         if (!weights) return nullptr;
         auto layer = std::make_shared<MatmulLayer>(device_type_, output_dim, input_dim);
-        CHECK(layer->set_weight(0, {output_dim, input_dim}, weights, host));
+        if (quant_group_size_ > 0)
+        {
+            std::vector<float> float_weights(static_cast<size_t>(output_dim) * input_dim);
+            for (size_t i = 0; i < float_weights.size(); ++i)
+                float_weights[i] = fp16_to_float(weights[i]);
+            const Status status = layer->set_quantized_weight(
+                float_weights.data(), float_weights.size(), quant_group_size_);
+            if (!status)
+            {
+                weight_loading_error_ = status.get_err_msg();
+                return nullptr;
+            }
+        }
+        else
+        {
+            CHECK(layer->set_weight(0, {output_dim, input_dim}, weights, host));
+        }
+        if (has_bias)
+        {
+            uint16_t* bias = load_weight(name.substr(0, name.size() - 6) + "bias", {output_dim});
+            if (!bias) return nullptr;
+            const Status bias_status = layer->set_bias(bias, static_cast<size_t>(output_dim));
+            if (!bias_status)
+            {
+                weight_loading_error_ = bias_status.get_err_msg();
+                return nullptr;
+            }
+        }
         return layer;
     };
     const auto create_norm = [this, host](const std::string& name,
                                           int32_t width) -> std::shared_ptr<Layer> {
-        float* weights = load_weight(name, {width});
+        uint16_t* weights = load_weight(name, {width});
         if (!weights) return nullptr;
         auto layer = std::make_shared<RmsNormLayer>(device_type_, width, rms_norm_eps_);
         CHECK(layer->set_weight(0, {width}, weights, host));
         return layer;
     };
 
-    float* embedding_weights = load_weight("model.embed_tokens.weight", {vocab_size, dim});
+    uint16_t* embedding_weights = load_weight("model.embed_tokens.weight", {vocab_size, dim});
     if (!embedding_weights) return;
     auto embedding = std::make_shared<EmbeddingLayer>(device_type_, dim,
                                                        config_->seq_len_, vocab_size);
@@ -171,12 +217,15 @@ void Qwen3Model::create_param_layers()
         const std::string prefix = "model.layers." + std::to_string(index) + ".";
         Qwen3DecoderLayer layer;
         layer.input_norm_ = create_norm(prefix + "input_layernorm.weight", dim);
-        layer.q_proj_ = create_projection(prefix + "self_attn.q_proj.weight", query_dim, dim);
-        layer.k_proj_ = create_projection(prefix + "self_attn.k_proj.weight", kv_dim, dim);
-        layer.v_proj_ = create_projection(prefix + "self_attn.v_proj.weight", kv_dim, dim);
+        layer.q_proj_ = create_projection(prefix + "self_attn.q_proj.weight", query_dim, dim, !is_qwen3_);
+        layer.k_proj_ = create_projection(prefix + "self_attn.k_proj.weight", kv_dim, dim, !is_qwen3_);
+        layer.v_proj_ = create_projection(prefix + "self_attn.v_proj.weight", kv_dim, dim, !is_qwen3_);
         layer.o_proj_ = create_projection(prefix + "self_attn.o_proj.weight", dim, query_dim);
-        layer.q_norm_ = create_norm(prefix + "self_attn.q_norm.weight", qwen_head_dim_);
-        layer.k_norm_ = create_norm(prefix + "self_attn.k_norm.weight", qwen_head_dim_);
+        if (is_qwen3_)
+        {
+            layer.q_norm_ = create_norm(prefix + "self_attn.q_norm.weight", qwen_head_dim_);
+            layer.k_norm_ = create_norm(prefix + "self_attn.k_norm.weight", qwen_head_dim_);
+        }
         layer.post_attention_norm_ =
             create_norm(prefix + "post_attention_layernorm.weight", dim);
         layer.gate_proj_ = create_projection(prefix + "mlp.gate_proj.weight", hidden_dim, dim);
@@ -184,7 +233,7 @@ void Qwen3Model::create_param_layers()
         layer.down_proj_ = create_projection(prefix + "mlp.down_proj.weight", dim, hidden_dim);
 
         if (!layer.input_norm_ || !layer.q_proj_ || !layer.k_proj_ || !layer.v_proj_ ||
-            !layer.o_proj_ || !layer.q_norm_ || !layer.k_norm_ ||
+            !layer.o_proj_ || (is_qwen3_ && (!layer.q_norm_ || !layer.k_norm_)) ||
             !layer.post_attention_norm_ || !layer.gate_proj_ || !layer.up_proj_ ||
             !layer.down_proj_)
             return;
@@ -195,9 +244,25 @@ void Qwen3Model::create_param_layers()
     if (!qwen3_layers_->final_norm_) return;
 
     auto lm_head = std::make_shared<MatmulLayer>(device_type_, vocab_size, dim);
-    CHECK(lm_head->set_weight(0, {vocab_size, dim}, embedding_weights, host));
+    if (quant_group_size_ > 0)
+    {
+        std::vector<float> float_weights(static_cast<size_t>(vocab_size) * dim);
+        for (size_t i = 0; i < float_weights.size(); ++i)
+            float_weights[i] = fp16_to_float(embedding_weights[i]);
+        const Status status = lm_head->set_quantized_weight(
+            float_weights.data(), float_weights.size(), quant_group_size_);
+        if (!status)
+        {
+            weight_loading_error_ = status.get_err_msg();
+            return;
+        }
+    }
+    else
+    {
+        CHECK(lm_head->set_weight(0, {vocab_size, dim}, embedding_weights, host));
+    }
     qwen3_layers_->lm_head_ = lm_head;
-    qwen3_layers_->tied_weights_ = true;
+    qwen3_layers_->tied_weights_ = quant_group_size_ == 0;
 }
 
 void Qwen3Model::create_shared_layers()
@@ -249,7 +314,7 @@ void Qwen3Model::init_mem()
     }
 
     Tensor input_tokens(DataType::kDataTypeInt32, 1, true, host_allocator);
-    Tensor input_embeddings(DataType::kDataTypeFp32, 1, config_->dim_, true, device_allocator);
+    Tensor input_embeddings(DataType::kDataTypeFp16, 1, config_->dim_, true, device_allocator);
     Tensor sin_cache(DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
                      true, device_allocator);
     Tensor cos_cache(DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,

@@ -1,4 +1,5 @@
 #include "swiglu_kernel_cpu.h"
+#include "fp16.h"
 
 namespace my_vllm 
 {
@@ -13,11 +14,13 @@ void swiglu_kernel_cpu(const Tensor& input1, const Tensor& input2, const Tensor&
     CHECK(input2.device_type() == DeviceType::kDeviceCPU);
     CHECK(output.device_type() == DeviceType::kDeviceCPU);
 
-    arma::fvec input1_vec(const_cast<float*>(input1.ptr<float>()), input1.size(), false, true);
-    arma::fvec input2_vec(const_cast<float*>(input2.ptr<float>()), input2.size(), false, true);
-    arma::fvec output_vec(const_cast<float*>(output.ptr<float>()), output.size(), false, true);
-
-    input1_vec %= (1.0f / (1.0f + arma::exp(-input1_vec)));
-    output_vec = input1_vec % input2_vec;
+    const uint16_t* gate = input1.ptr<uint16_t>();
+    const uint16_t* up = input2.ptr<uint16_t>();
+    uint16_t* out = const_cast<uint16_t*>(output.ptr<uint16_t>());
+    for (size_t i = 0; i < input1.size(); ++i)
+    {
+        const float x = fp16_to_float(gate[i]);
+        out[i] = float_to_fp16((x / (1.0f + std::exp(-x))) * fp16_to_float(up[i]));
+    }
     }
 }  // namespace my_vllm

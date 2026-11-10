@@ -49,6 +49,12 @@ Status Qwen3Model::init(DeviceType device_type)
         if (error != cudaSuccess)
             return InternalError(std::string("Failed to create CUDA stream: ") +
                                  cudaGetErrorString(error));
+        cublasStatus_t blas_status = cublasCreate(&cuda_config_->cublas_handle);
+        if (blas_status != CUBLAS_STATUS_SUCCESS)
+            return InternalError("Failed to create the cuBLAS handle.");
+        blas_status = cublasSetStream(cuda_config_->cublas_handle, cuda_config_->stream);
+        if (blas_status != CUBLAS_STATUS_SUCCESS)
+            return InternalError("Failed to bind cuBLAS to the Qwen3 CUDA stream.");
     }
 
     Status status = gen_model_from_file();
@@ -74,6 +80,16 @@ Status Qwen3Model::init(DeviceType device_type)
         weight_storage_.shrink_to_fit();
     }
 
+    return Success();
+}
+
+Status Qwen3Model::set_weight_quantization(int32_t group_size)
+{
+    if (qwen3_layers_)
+        return InvalidArgument("Set weight quantization before initializing the model.");
+    if (group_size < 0)
+        return InvalidArgument("INT8 quantization group size cannot be negative.");
+    quant_group_size_ = group_size;
     return Success();
 }
 
@@ -144,7 +160,7 @@ size_t Qwen3Model::paged_kv_cache_size_bytes(int32_t num_blocks, int32_t block_s
                                 static_cast<size_t>(num_blocks),
                                 static_cast<size_t>(block_size),
                                 static_cast<size_t>(config_->kv_dim_),
-                                sizeof(float)})
+                                sizeof(uint16_t)})
     {
         if (factor != 0 && bytes > std::numeric_limits<size_t>::max() / factor) return 0;
         bytes *= factor;

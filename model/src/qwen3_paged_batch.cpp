@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "fp16.h"
 
 #include <cuda_runtime_api.h>
 
@@ -11,6 +12,7 @@
 #include "rope_kernel_cpu.h"
 #include "rope_kernel_cuda.cuh"
 #include "rmsnorm.h"
+#include "sampling_kernel_cuda.cuh"
 
 namespace my_vllm
 {
@@ -36,14 +38,18 @@ Tensor tensor_view(DataType type, std::vector<int32_t> dims, void* ptr,
     view.set_device_type(device);
     return view;
 }
+
 }  // namespace
 
 Status Qwen3Model::forward_paged_batch(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<std::vector<int32_t>>& block_tables,
-    const std::vector<size_t>& sample_rows, std::vector<std::vector<float>>& logits)
+    const std::vector<size_t>& sample_rows, std::vector<std::vector<float>>& logits,
+    const std::vector<float>* temperatures, const std::vector<uint64_t>* seeds,
+    std::vector<int32_t>* sampled_tokens)
 {
     logits.clear();
+    if (sampled_tokens) sampled_tokens->clear();
     if (paged_num_blocks_ <= 0 || paged_block_size_ <= 0 || paged_max_batch_tokens_ <= 0)
         return InternalError("Configure the paged KV cache before running a batch.");
     if (token_ids.empty() || token_ids.size() != positions.size() ||
@@ -137,13 +143,13 @@ Status Qwen3Model::forward_paged_batch(
 
     for (int32_t layer = 0; layer < config_->layer_num_; ++layer)
     {
-        Tensor normalized = allocated_tensor(DataType::kDataTypeFp32, {rows, dim}, allocator);
+        Tensor normalized = allocated_tensor(DataType::kDataTypeFp16, {rows, dim}, allocator);
         status = qwen3_layers_->decoder_layers_.at(layer).input_norm_->forward(hidden, normalized);
         if (!status) return status;
 
-        Tensor query = allocated_tensor(DataType::kDataTypeFp32, {rows, query_dim}, allocator);
-        Tensor keys = allocated_tensor(DataType::kDataTypeFp32, {rows, kv_dim}, allocator);
-        Tensor values = allocated_tensor(DataType::kDataTypeFp32, {rows, kv_dim}, allocator);
+        Tensor query = allocated_tensor(DataType::kDataTypeFp16, {rows, query_dim}, allocator);
+        Tensor keys = allocated_tensor(DataType::kDataTypeFp16, {rows, kv_dim}, allocator);
+        Tensor values = allocated_tensor(DataType::kDataTypeFp16, {rows, kv_dim}, allocator);
         status = qwen3_layers_->decoder_layers_.at(layer).q_proj_->forward(normalized, query);
         if (!status) return status;
         status = qwen3_layers_->decoder_layers_.at(layer).k_proj_->forward(normalized, keys);
@@ -152,33 +158,39 @@ Status Qwen3Model::forward_paged_batch(
         if (!status) return status;
 
         Tensor query_heads = tensor_view(
-            DataType::kDataTypeFp32,
-            {rows * config_->head_num_, config_->head_size_}, query.ptr<float>(),
+            DataType::kDataTypeFp16,
+            {rows * config_->head_num_, config_->head_size_}, query.ptr<uint16_t>(),
             device_type_);
         Tensor key_heads = tensor_view(
-            DataType::kDataTypeFp32,
-            {rows * config_->kv_head_num_, config_->head_size_}, keys.ptr<float>(),
+            DataType::kDataTypeFp16,
+            {rows * config_->kv_head_num_, config_->head_size_}, keys.ptr<uint16_t>(),
             device_type_);
-        status = qwen3_layers_->decoder_layers_.at(layer).q_norm_->forward(query_heads, query_heads);
-        if (!status) return status;
-        status = qwen3_layers_->decoder_layers_.at(layer).k_norm_->forward(key_heads, key_heads);
-        if (!status) return status;
+        if (qwen3_layers_->decoder_layers_.at(layer).q_norm_)
+        {
+            status = qwen3_layers_->decoder_layers_.at(layer).q_norm_->forward(query_heads, query_heads);
+            if (!status) return status;
+        }
+        if (qwen3_layers_->decoder_layers_.at(layer).k_norm_)
+        {
+            status = qwen3_layers_->decoder_layers_.at(layer).k_norm_->forward(key_heads, key_heads);
+            if (!status) return status;
+        }
 
         if (device_type_ == DeviceType::kDeviceCPU)
         {
-            float* key_cache = const_cast<float*>(
-                get_buffer(ModelBufferType::kKeyCache).ptr<float>());
-            float* value_cache = const_cast<float*>(
-                get_buffer(ModelBufferType::kValueCache).ptr<float>());
+            uint16_t* key_cache = const_cast<uint16_t*>(
+                get_buffer(ModelBufferType::kKeyCache).ptr<uint16_t>());
+            uint16_t* value_cache = const_cast<uint16_t*>(
+                get_buffer(ModelBufferType::kValueCache).ptr<uint16_t>());
             for (int32_t row = 0; row < rows; ++row)
             {
                 pos_view.index<int32_t>(0) = positions[static_cast<size_t>(row)];
                 Tensor query_row = tensor_view(
-                    DataType::kDataTypeFp32, {query_dim},
-                    query.ptr<float>(static_cast<int64_t>(row) * query_dim), device_type_);
+                    DataType::kDataTypeFp16, {query_dim},
+                    query.ptr<uint16_t>(static_cast<int64_t>(row) * query_dim), device_type_);
                 Tensor key_row = tensor_view(
-                    DataType::kDataTypeFp32, {kv_dim},
-                    keys.ptr<float>(static_cast<int64_t>(row) * kv_dim), device_type_);
+                    DataType::kDataTypeFp16, {kv_dim},
+                    keys.ptr<uint16_t>(static_cast<int64_t>(row) * kv_dim), device_type_);
                 qwen3_rope_kernel_cpu(
                     config_->head_num_, config_->kv_head_num_, config_->head_size_,
                     query_row, key_row, pos_view, get_buffer(ModelBufferType::kSinCache),
@@ -192,14 +204,14 @@ Status Qwen3Model::forward_paged_batch(
                          static_cast<size_t>(paged_block_size_) +
                      position % static_cast<size_t>(paged_block_size_)) *
                     static_cast<size_t>(kv_dim);
-                const float* key_source =
-                    keys.ptr<float>(static_cast<int64_t>(row) * kv_dim);
-                const float* value_source =
-                    values.ptr<float>(static_cast<int64_t>(row) * kv_dim);
+                const uint16_t* key_source =
+                    keys.ptr<uint16_t>(static_cast<int64_t>(row) * kv_dim);
+                const uint16_t* value_source =
+                    values.ptr<uint16_t>(static_cast<int64_t>(row) * kv_dim);
                 std::memcpy(key_cache + offset, key_source,
-                            static_cast<size_t>(kv_dim) * sizeof(float));
+                            static_cast<size_t>(kv_dim) * sizeof(uint16_t));
                 std::memcpy(value_cache + offset, value_source,
-                            static_cast<size_t>(kv_dim) * sizeof(float));
+                            static_cast<size_t>(kv_dim) * sizeof(uint16_t));
             }
         }
         else
@@ -216,18 +228,18 @@ Status Qwen3Model::forward_paged_batch(
         }
 
         Tensor mha_output = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, query_dim}, allocator);
+            DataType::kDataTypeFp16, {rows, query_dim}, allocator);
         if (device_type_ == DeviceType::kDeviceCPU)
         {
             for (int32_t row = 0; row < rows; ++row)
             {
                 const int32_t position = positions[static_cast<size_t>(row)];
                 Tensor query_row = tensor_view(
-                    DataType::kDataTypeFp32, {query_dim},
-                    query.ptr<float>(static_cast<int64_t>(row) * query_dim), device_type_);
+                    DataType::kDataTypeFp16, {query_dim},
+                    query.ptr<uint16_t>(static_cast<int64_t>(row) * query_dim), device_type_);
                 Tensor output_row = tensor_view(
-                    DataType::kDataTypeFp32, {query_dim},
-                    mha_output.ptr<float>(static_cast<int64_t>(row) * query_dim), device_type_);
+                    DataType::kDataTypeFp16, {query_dim},
+                    mha_output.ptr<uint16_t>(static_cast<int64_t>(row) * query_dim), device_type_);
                 const int32_t* table_data = attention_tables.ptr<int32_t>() +
                     static_cast<size_t>(row) * static_cast<size_t>(max_table_entries);
                 Tensor table_row = tensor_view(
@@ -253,60 +265,102 @@ Status Qwen3Model::forward_paged_batch(
         }
 
         Tensor attention_output = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, dim}, allocator);
+            DataType::kDataTypeFp16, {rows, dim}, allocator);
         status = qwen3_layers_->decoder_layers_.at(layer).o_proj_->forward(mha_output,
                                                                attention_output);
         if (!status) return status;
 
-        Tensor residual = allocated_tensor(DataType::kDataTypeFp32, {rows, dim}, allocator);
+        Tensor residual = allocated_tensor(DataType::kDataTypeFp16, {rows, dim}, allocator);
         status = qwen3_layers_->add_layer_->forward(hidden, attention_output, residual);
         if (!status) return status;
         Tensor ffn_normalized = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, dim}, allocator);
+            DataType::kDataTypeFp16, {rows, dim}, allocator);
         status = qwen3_layers_->decoder_layers_.at(layer).post_attention_norm_->forward(residual, ffn_normalized);
         if (!status) return status;
 
         Tensor gate = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, hidden_dim}, allocator);
+            DataType::kDataTypeFp16, {rows, hidden_dim}, allocator);
         Tensor up = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, hidden_dim}, allocator);
+            DataType::kDataTypeFp16, {rows, hidden_dim}, allocator);
         status = qwen3_layers_->decoder_layers_.at(layer).gate_proj_->forward(ffn_normalized, gate);
         if (!status) return status;
         status = qwen3_layers_->decoder_layers_.at(layer).up_proj_->forward(ffn_normalized, up);
         if (!status) return status;
         Tensor activated = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, hidden_dim}, allocator);
+            DataType::kDataTypeFp16, {rows, hidden_dim}, allocator);
         status = qwen3_layers_->swiglu_layer_->forward(gate, up, activated);
         if (!status) return status;
-        Tensor down = allocated_tensor(DataType::kDataTypeFp32, {rows, dim}, allocator);
+        Tensor down = allocated_tensor(DataType::kDataTypeFp16, {rows, dim}, allocator);
         status = qwen3_layers_->decoder_layers_.at(layer).down_proj_->forward(activated, down);
         if (!status) return status;
 
         Tensor next_hidden = allocated_tensor(
-            DataType::kDataTypeFp32, {rows, dim}, allocator);
+            DataType::kDataTypeFp16, {rows, dim}, allocator);
         status = qwen3_layers_->add_layer_->forward(residual, down, next_hidden);
         if (!status) return status;
         hidden = std::move(next_hidden);
     }
 
     Tensor final_hidden = allocated_tensor(
-        DataType::kDataTypeFp32, {rows, dim}, allocator);
+        DataType::kDataTypeFp16, {rows, dim}, allocator);
     status = qwen3_layers_->final_norm_->forward(hidden, final_hidden);
     if (!status) return status;
 
     logits.reserve(sample_rows.size());
-    for (const size_t row : sample_rows)
+    if (sample_rows.empty()) return Success();
+
+    bool all_rows_selected = sample_rows.size() == batch_size;
+    for (size_t index = 0; all_rows_selected && index < sample_rows.size(); ++index)
+        all_rows_selected = sample_rows[index] == index;
+
+    Tensor sampled_hidden;
+    if (all_rows_selected)
     {
-        Tensor hidden_row = tensor_view(
-            DataType::kDataTypeFp32, {dim},
-            final_hidden.ptr<float>(static_cast<int64_t>(row) * dim), device_type_);
-        Tensor row_logits = allocated_tensor(
-            DataType::kDataTypeFp32, {config_->vocab_size_}, allocator);
-        status = qwen3_layers_->lm_head_->forward(hidden_row, row_logits);
-        if (!status) return status;
-        if (device_type_ == DeviceType::kDeviceCUDA) row_logits.to_cpu();
-        logits.emplace_back(row_logits.ptr<float>(),
-                            row_logits.ptr<float>() + row_logits.size());
+        sampled_hidden = std::move(final_hidden);
+    }
+    else
+    {
+        sampled_hidden = allocated_tensor(DataType::kDataTypeFp16,
+            {static_cast<int32_t>(sample_rows.size()), dim}, allocator);
+        if (device_type_ == DeviceType::kDeviceCPU)
+        {
+            for (size_t index = 0; index < sample_rows.size(); ++index)
+                std::memcpy(sampled_hidden.ptr<uint16_t>(static_cast<int64_t>(index) * dim),
+                    final_hidden.ptr<uint16_t>(static_cast<int64_t>(sample_rows[index]) * dim),
+                    static_cast<size_t>(dim) * sizeof(uint16_t));
+        }
+        else
+        {
+            std::vector<int32_t> row_indices;
+            row_indices.reserve(sample_rows.size());
+            for (const size_t row : sample_rows)
+                row_indices.push_back(static_cast<int32_t>(row));
+            gather_rows_cuda(dim, row_indices, final_hidden, sampled_hidden,
+                             cuda_config_.get());
+        }
+    }
+
+    Tensor batch_logits = allocated_tensor(DataType::kDataTypeFp16,
+        {static_cast<int32_t>(sample_rows.size()), config_->vocab_size_}, allocator);
+    status = qwen3_layers_->lm_head_->forward(sampled_hidden, batch_logits);
+    if (!status) return status;
+    if (sampled_tokens && temperatures && seeds &&
+        temperatures->size() == sample_rows.size() && seeds->size() == sample_rows.size() &&
+        device_type_ == DeviceType::kDeviceCUDA)
+    {
+        sample_logits_gumbel_cuda(batch_logits, *temperatures, *seeds,
+                                  *sampled_tokens, cuda_config_.get());
+        return Success();
+    }
+    if (device_type_ == DeviceType::kDeviceCUDA) batch_logits.to_cpu();
+    for (size_t index = 0; index < sample_rows.size(); ++index)
+    {
+        const uint16_t* begin = batch_logits.ptr<uint16_t>(
+            static_cast<int64_t>(index) * config_->vocab_size_);
+        auto& row = logits.emplace_back();
+        row.reserve(static_cast<size_t>(config_->vocab_size_));
+        for (int32_t token = 0; token < config_->vocab_size_; ++token)
+            row.push_back(fp16_to_float(begin[token]));
     }
     return Success();
 }

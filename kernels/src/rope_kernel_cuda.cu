@@ -1,4 +1,5 @@
 #include "rope_kernel_cuda.cuh"
+#include <cuda_fp16.h>
 
 namespace my_vllm 
 {
@@ -197,7 +198,7 @@ __global__ void qwen3_sin_cos_calc(int32_t head_size, int32_t max_seq_len, float
 }
 
 __global__ void qwen3_rope_kernel(int32_t pos, int32_t query_heads, int32_t kv_heads,
-                                  int32_t head_size, float* query, float* key,
+                                  int32_t head_size, __half* query, __half* key,
                                   const float* sin_cache, const float* cos_cache)
 {
     const int32_t half = head_size / 2;
@@ -211,22 +212,22 @@ __global__ void qwen3_rope_kernel(int32_t pos, int32_t query_heads, int32_t kv_h
     const float sine = sin_cache[pos * head_size + i];
     const float cosine = cos_cache[pos * head_size + i];
 
-    const float qx = query[first];
-    const float qy = query[second];
-    query[first] = qx * cosine - qy * sine;
-    query[second] = qx * sine + qy * cosine;
+    const float qx = __half2float(query[first]);
+    const float qy = __half2float(query[second]);
+    query[first] = __float2half(qx * cosine - qy * sine);
+    query[second] = __float2half(qx * sine + qy * cosine);
     if (head < kv_heads)
     {
-        const float kx = key[first];
-        const float ky = key[second];
-        key[first] = kx * cosine - ky * sine;
-        key[second] = kx * sine + ky * cosine;
+        const float kx = __half2float(key[first]);
+        const float ky = __half2float(key[second]);
+        key[first] = __float2half(kx * cosine - ky * sine);
+        key[second] = __float2half(kx * sine + ky * cosine);
     }
 }
 
 __global__ void qwen3_rope_batch_kernel(
     int32_t rows, int32_t query_heads, int32_t kv_heads, int32_t head_size,
-    float* query, float* key, const int32_t* positions,
+    __half* query, __half* key, const int32_t* positions,
     const float* sin_cache, const float* cos_cache)
 {
     const int32_t half = head_size / 2;
@@ -245,17 +246,17 @@ __global__ void qwen3_rope_batch_kernel(
     const float sine = sin_cache[position * head_size + i];
     const float cosine = cos_cache[position * head_size + i];
 
-    const float qx = query[first];
-    const float qy = query[second];
-    query[first] = qx * cosine - qy * sine;
-    query[second] = qx * sine + qy * cosine;
+    const float qx = __half2float(query[first]);
+    const float qy = __half2float(query[second]);
+    query[first] = __float2half(qx * cosine - qy * sine);
+    query[second] = __float2half(qx * sine + qy * cosine);
     if (head < kv_heads)
     {
         const int32_t k_offset = row * kv_heads * head_size + head * head_size;
-        const float kx = key[k_offset + i];
-        const float ky = key[k_offset + i + half];
-        key[k_offset + i] = kx * cosine - ky * sine;
-        key[k_offset + i + half] = kx * sine + ky * cosine;
+        const float kx = __half2float(key[k_offset + i]);
+        const float ky = __half2float(key[k_offset + i + half]);
+        key[k_offset + i] = __float2half(kx * cosine - ky * sine);
+        key[k_offset + i + half] = __float2half(kx * sine + ky * cosine);
     }
 }
 
@@ -282,8 +283,10 @@ void qwen3_rope_kernel_cu(int32_t query_heads, int32_t kv_heads, int32_t head_si
     const int32_t blocks = (total_pairs + threads - 1) / threads;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     qwen3_rope_kernel<<<blocks, threads, 0, cuda_stream>>>(
-        pos, query_heads, kv_heads, head_size, const_cast<float*>(input_q.ptr<float>()),
-        const_cast<float*>(input_k.ptr<float>()), sin_cache.ptr<float>(), cos_cache.ptr<float>());
+        pos, query_heads, kv_heads, head_size,
+        reinterpret_cast<__half*>(const_cast<uint16_t*>(input_q.ptr<uint16_t>())),
+        reinterpret_cast<__half*>(const_cast<uint16_t*>(input_k.ptr<uint16_t>())),
+        sin_cache.ptr<float>(), cos_cache.ptr<float>());
 }
 
 void qwen3_rope_batch_kernel_cu(int32_t rows, int32_t query_heads, int32_t kv_heads,
@@ -299,7 +302,8 @@ void qwen3_rope_batch_kernel_cu(int32_t rows, int32_t query_heads, int32_t kv_he
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     qwen3_rope_batch_kernel<<<blocks, threads, 0, cuda_stream>>>(
         rows, query_heads, kv_heads, head_size,
-        const_cast<float*>(input_q.ptr<float>()), const_cast<float*>(input_k.ptr<float>()),
+        reinterpret_cast<__half*>(const_cast<uint16_t*>(input_q.ptr<uint16_t>())),
+        reinterpret_cast<__half*>(const_cast<uint16_t*>(input_k.ptr<uint16_t>())),
         positions.ptr<int32_t>(), sin_cache.ptr<float>(), cos_cache.ptr<float>());
     CHECK_EQ(cudaGetLastError(), cudaSuccess);
 }

@@ -28,8 +28,12 @@ public:
     void release(void* ptr) const override;
 
 private:
+    void release_idle_buffers(int device_id) const;
+    void trim_idle_buffers_if_needed(int device_id) const;
+
     //mutable声明，允许在const函数内部修改成员
     mutable std::map<int, size_t> no_busy_cnt_;
+    mutable std::map<int, size_t> big_no_busy_cnt_;
     mutable std::map<int, std::vector<CudaMemoryBuffer>> big_buffers_map_;
     mutable std::map<int, std::vector<CudaMemoryBuffer>> cuda_buffers_map_;
 };

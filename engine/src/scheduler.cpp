@@ -41,72 +41,16 @@ Status Scheduler::schedule(BatchPlan& plan)
 {
     plan = BatchPlan{};
     size_t batched_tokens = 0;
-
-    while (not waiting_.empty() and
-           plan.sequences.size() < static_cast<size_t>(config_.max_num_seqs))
-    {
-        const std::shared_ptr<Sequence> sequence = waiting_.front();
-        if (sequence->block_table.empty())
-        {
-            int32_t cached_blocks = 0;
-            if (not block_manager_.can_allocate(*sequence, cached_blocks))
-            {
-                if (sequence->num_blocks() > static_cast<size_t>(block_manager_.capacity()))
-                {
-                    return InvalidArgument("The prompt requires more KV blocks than the engine owns.");
-                }
-                break;
-            }
-            const Status status = block_manager_.allocate(*sequence, cached_blocks);
-            if (not status) return status;
-        }
-
-        const size_t remaining_tokens = sequence->size() - sequence->num_cached_tokens;
-        if (remaining_tokens == 0)
-        {
-            return InternalError("A waiting prompt has no uncached tokens to schedule.");
-        }
-        const size_t available = static_cast<size_t>(config_.max_num_batched_tokens) -
-                                 batched_tokens;
-        if (available == 0) break;
-        if (available < remaining_tokens and not plan.sequences.empty()) break;
-
-        const size_t scheduled = std::min(remaining_tokens, available);
-        sequence->num_scheduled_tokens = scheduled;
-        sequence->is_prefill = true;
-        plan.sequences.push_back({sequence, sequence->num_cached_tokens, scheduled});
-        batched_tokens += scheduled;
-
-        if (sequence->num_cached_tokens + scheduled == sequence->size())
-        {
-            waiting_.pop_front();
-            sequence->status = SequenceStatus::kRunning;
-            running_.push_back(sequence);
-        }
-        else
-        {
-            break;
-        }
-    }
-
-    if (not plan.sequences.empty())
-    {
-        plan.is_prefill = true;
-        plan.num_tokens = batched_tokens;
-        return Success();
-    }
-
-    bool preempted_sequence = false;
     const size_t candidates = running_.size();
     for (size_t index = 0; index < candidates and
          plan.sequences.size() < static_cast<size_t>(config_.max_num_seqs); ++index)
     {
+        if (batched_tokens >= static_cast<size_t>(config_.max_num_batched_tokens)) break;
         const std::shared_ptr<Sequence> sequence = running_.front();
         running_.pop_front();
         if (not block_manager_.can_append(*sequence))
         {
             preempt(sequence);
-            preempted_sequence = true;
             continue;
         }
 
@@ -114,22 +58,65 @@ Status Scheduler::schedule(BatchPlan& plan)
         if (not status)
         {
             preempt(sequence);
-            preempted_sequence = true;
             continue;
         }
         sequence->num_scheduled_tokens = 1;
         sequence->is_prefill = false;
-        plan.sequences.push_back({sequence, sequence->size() - 1, 1});
+        plan.sequences.push_back({sequence, sequence->size() - 1, 1, false});
         running_.push_back(sequence);
+        ++batched_tokens;
     }
 
-    plan.is_prefill = false;
-    plan.num_tokens = plan.sequences.size();
-    if (plan.sequences.empty() and not is_finished())
+    // Admit waiting prompts into the remaining token budget. Each waiting
+    // sequence receives at most one prefill chunk per scheduling iteration.
+    size_t waiting_candidates = waiting_.size();
+    while (waiting_candidates-- > 0 &&
+           plan.sequences.size() < static_cast<size_t>(config_.max_num_seqs) &&
+           batched_tokens < static_cast<size_t>(config_.max_num_batched_tokens))
     {
-        if (preempted_sequence) return schedule(plan);
-        return InternalError("The scheduler could not make progress with the available KV blocks.");
+        const std::shared_ptr<Sequence> sequence = waiting_.front();
+        waiting_.pop_front();
+        if (sequence->block_table.empty())
+        {
+            int32_t cached_blocks = 0;
+            if (not block_manager_.can_allocate(*sequence, cached_blocks))
+            {
+                if (sequence->num_blocks() > static_cast<size_t>(block_manager_.capacity()))
+                    return InvalidArgument("The prompt requires more KV blocks than the engine owns.");
+                waiting_.push_back(sequence);
+                continue;
+            }
+            const Status status = block_manager_.allocate(*sequence, cached_blocks);
+            if (not status) return status;
+        }
+
+        const size_t remaining_tokens = sequence->size() - sequence->num_cached_tokens;
+        if (remaining_tokens == 0)
+            return InternalError("A waiting prompt has no uncached tokens to schedule.");
+        const size_t available = static_cast<size_t>(config_.max_num_batched_tokens) - batched_tokens;
+        const size_t scheduled = std::min(remaining_tokens, available);
+        sequence->num_scheduled_tokens = scheduled;
+        sequence->is_prefill = true;
+        plan.sequences.push_back({sequence, sequence->num_cached_tokens, scheduled, true});
+        batched_tokens += scheduled;
+
+        if (sequence->num_cached_tokens + scheduled == sequence->size())
+        {
+            sequence->status = SequenceStatus::kRunning;
+            running_.push_back(sequence);
+        }
+        else
+        {
+            waiting_.push_back(sequence);
+        }
     }
+
+    plan.num_tokens = batched_tokens;
+    plan.is_prefill = !plan.sequences.empty() &&
+        std::all_of(plan.sequences.begin(), plan.sequences.end(),
+                    [](const ScheduledSequence& item) { return item.is_prefill; });
+    if (plan.sequences.empty() and not is_finished())
+        return InternalError("The scheduler could not make progress with the available KV blocks.");
     return Success();
 }
 
@@ -150,7 +137,8 @@ Status Scheduler::postprocess(const BatchPlan& plan,
         sequence->num_cached_tokens += sequence->num_scheduled_tokens;
         sequence->num_scheduled_tokens = 0;
 
-        if (plan.is_prefill and sequence->num_cached_tokens < sequence->size()) continue;
+        if (plan.sequences[index].is_prefill and
+            sequence->num_cached_tokens < sequence->size()) continue;
         const int32_t token = sampled_tokens[index];
         if (token < 0)
         {

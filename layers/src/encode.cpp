@@ -129,8 +129,10 @@ QwenEncodeLayer::QwenEncodeLayer(std::string token_model_path, bool has_bos, boo
 
 #endif
 
-Qwen3EncodeLayer::Qwen3EncodeLayer(std::string token_model_path, bool has_bos, bool has_eos)
-    : EncodeLayerBase(std::move(token_model_path), has_bos, has_eos)
+Qwen3EncodeLayer::Qwen3EncodeLayer(std::string token_model_path, bool has_bos, bool has_eos,
+                                   bool qwen3_pattern)
+    : EncodeLayerBase(std::move(token_model_path), has_bos, has_eos),
+      qwen3_pattern_(qwen3_pattern)
 {
     std::ifstream input(token_model_path_);
     if (!input)
@@ -154,13 +156,24 @@ Qwen3EncodeLayer::Qwen3EncodeLayer(std::string token_model_path, bool has_bos, b
     int32_t rank = 0;
     for (const auto& merge : json["model"]["merges"])
     {
-        if (!merge.is_array() || merge.size() != 2)
+        std::string left;
+        std::string right;
+        if (merge.is_array() && merge.size() == 2)
         {
-            throw std::runtime_error("Unexpected Qwen3 BPE merge format in tokenizer.json.");
+            left = merge[0].get<std::string>();
+            right = merge[1].get<std::string>();
         }
-        merge_ranks_.emplace(merge[0].get<std::string>() + " " +
-                                 merge[1].get<std::string>(),
-                             rank++);
+        else if (merge.is_string())
+        {
+            const std::string pair = merge.get<std::string>();
+            const size_t separator = pair.find(' ');
+            if (separator == std::string::npos)
+                throw std::runtime_error("Unexpected BPE merge string in tokenizer.json.");
+            left = pair.substr(0, separator);
+            right = pair.substr(separator + 1);
+        }
+        else throw std::runtime_error("Unexpected BPE merge format in tokenizer.json.");
+        merge_ranks_.emplace(left + " " + right, rank++);
     }
 
     if (json.contains("added_tokens"))
@@ -234,8 +247,9 @@ std::vector<int32_t> Qwen3EncodeLayer::encode_piece(const std::string& piece) co
 void Qwen3EncodeLayer::encode_ordinary(const std::string& text,
                                        std::vector<int32_t>& output) const
 {
-    static const std::vector<std::string> pattern = {
-        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"};
+    const std::vector<std::string> pattern = {qwen3_pattern_
+        ? "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+        : "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"};
     for (const std::string& piece : unicode_regex_split(text, pattern))
     {
         auto ids = encode_piece(piece);

@@ -25,6 +25,7 @@ struct ScheduledSequence
     std::shared_ptr<Sequence> sequence;
     size_t token_start = 0;
     size_t token_count = 0;
+    bool is_prefill = false;
 };
 
 struct BatchPlan

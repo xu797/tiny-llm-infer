@@ -27,6 +27,32 @@ Status Qwen3ModelRunner::run_batch(const std::vector<ModelBatchToken>& tokens,
     return model_.forward_paged_batch(token_ids, positions, block_tables, sample_rows, logits);
 }
 
+Status Qwen3ModelRunner::run_batch_sampled(
+    const std::vector<ModelBatchToken>& tokens, const std::vector<size_t>& sample_rows,
+    const std::vector<float>& temperatures, const std::vector<uint64_t>& seeds,
+    std::vector<int32_t>& sampled_tokens)
+{
+    if (model_.device_type() != DeviceType::kDeviceCUDA)
+        return ModelRunner::run_batch_sampled(tokens, sample_rows, temperatures, seeds,
+                                              sampled_tokens);
+
+    std::vector<int32_t> token_ids;
+    std::vector<int32_t> positions;
+    std::vector<std::vector<int32_t>> block_tables;
+    token_ids.reserve(tokens.size());
+    positions.reserve(tokens.size());
+    block_tables.reserve(tokens.size());
+    for (const ModelBatchToken& token : tokens)
+    {
+        token_ids.push_back(token.token_id);
+        positions.push_back(token.position);
+        block_tables.push_back(token.block_table);
+    }
+    std::vector<std::vector<float>> logits;
+    return model_.forward_paged_batch(token_ids, positions, block_tables, sample_rows,
+                                      logits, &temperatures, &seeds, &sampled_tokens);
+}
+
 Status Qwen3ModelRunner::tokenize(const std::string& prompt,
                                   std::vector<int32_t>& token_ids) const
 {

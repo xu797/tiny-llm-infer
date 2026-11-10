@@ -217,6 +217,14 @@ static size_t data_type_size(DataType data_type)
         {
             return 4;
         }
+        case DataType::kDataTypeInt8:
+        {
+            return 1;
+        }
+        case DataType::kDataTypeFp16:
+        {
+            return 2;
+        }
         default: 
         {
             LOG(FATAL) << "Unknown data type size for " << int(data_type);

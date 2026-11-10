@@ -4,6 +4,29 @@
 
 namespace my_vllm
 {
+namespace
+{
+constexpr size_t kIdleBufferCacheLimit = size_t{1} << 30;
+
+void release_idle(std::vector<CudaMemoryBuffer>& buffers, int device_id)
+{
+    std::vector<CudaMemoryBuffer> busy_buffers;
+    busy_buffers.reserve(buffers.size());
+    for (const CudaMemoryBuffer& buffer : buffers)
+    {
+        if (buffer.busy)
+        {
+            busy_buffers.push_back(buffer);
+            continue;
+        }
+        const cudaError_t state = cudaFree(buffer.data);
+        CHECK(state == cudaSuccess)
+            << "Error: CUDA error when releasing cached memory on device " << device_id;
+    }
+    buffers.swap(busy_buffers);
+}
+}
+
 CUDADeviceAllocator::CUDADeviceAllocator() : DeviceAllocator(DeviceType::kDeviceCUDA)
 {
 
@@ -33,12 +56,18 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const
 
         if (sel_id != -1) 
         {
+            big_no_busy_cnt_[id] -= big_buffers[sel_id].byte_size;
             big_buffers[sel_id].busy = true;
             return big_buffers[sel_id].data;
         }
         //如果sel_id == -1, 说明缓存没命中
         void* ptr = nullptr;
         state = cudaMalloc(&ptr, byte_size);
+        if (state != cudaSuccess)
+        {
+            release_idle_buffers(id);
+            state = cudaMalloc(&ptr, byte_size);
+        }
         if (cudaSuccess != state) 
         {
             char buf[256];
@@ -62,6 +91,11 @@ void* CUDADeviceAllocator::allocate(size_t byte_size) const
     }
     void* ptr = nullptr;
     state = cudaMalloc(&ptr, byte_size);
+    if (state != cudaSuccess)
+    {
+        release_idle_buffers(id);
+        state = cudaMalloc(&ptr, byte_size);
+    }
     if (cudaSuccess != state) 
     {
         char buf[256];
@@ -82,61 +116,70 @@ void CUDADeviceAllocator::release(void* ptr) const
     {
         return;
     }
-    if (cuda_buffers_map_.empty())
-    {
-        return;
-    }
-    // 当某张 GPU 的小块缓存空闲总容量超过 1GB，就把这张卡小块池里所有空闲 buffer 全部 cudaFree 释放，只保留正在被占用的 buffer。
-    cudaError_t state = cudaSuccess;
     for (auto& it : cuda_buffers_map_) 
     {
-        if (no_busy_cnt_[it.first] > 1024 * 1024 * 1024)
+        for (CudaMemoryBuffer& buffer : it.second)
         {
-            auto& cuda_buffers = it.second;
-            std::vector<CudaMemoryBuffer> temp;
-            for (int i = 0; i < cuda_buffers.size(); i++) 
+            if (buffer.data == ptr)
             {
-                if (!cuda_buffers[i].busy) 
-                {
-                    state = cudaSetDevice(it.first);
-                    state = cudaFree(cuda_buffers[i].data);
-                    CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device " << it.first;
-                } 
-                else 
-                {
-                    temp.push_back(cuda_buffers[i]); //拷贝操作
-                }
+                if (!buffer.busy) return;
+                no_busy_cnt_[it.first] += buffer.byte_size;
+                buffer.busy = false;
+                trim_idle_buffers_if_needed(it.first);
+                return;
             }
-            cuda_buffers.clear();
-            it.second = temp;
-            no_busy_cnt_[it.first] = 0;
         }
+    }
+    for (auto& it : big_buffers_map_)
+    {
+        for (CudaMemoryBuffer& buffer : it.second)
+        {
+            if (buffer.data == ptr)
+            {
+                if (!buffer.busy) return;
+                big_no_busy_cnt_[it.first] += buffer.byte_size;
+                buffer.busy = false;
+                trim_idle_buffers_if_needed(it.first);
+                return;
+            }
+        }
+    }
+    const cudaError_t state = cudaFree(ptr);
+    CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device";
+}
+
+void CUDADeviceAllocator::release_idle_buffers(int device_id) const
+{
+    int current_device = device_id;
+    const cudaError_t get_device_state = cudaGetDevice(&current_device);
+    CHECK(get_device_state == cudaSuccess);
+    if (current_device != device_id)
+    {
+        const cudaError_t set_device_state = cudaSetDevice(device_id);
+        CHECK(set_device_state == cudaSuccess);
     }
 
-    for (auto& it : cuda_buffers_map_) 
+    release_idle(cuda_buffers_map_[device_id], device_id);
+    release_idle(big_buffers_map_[device_id], device_id);
+    no_busy_cnt_[device_id] = 0;
+    big_no_busy_cnt_[device_id] = 0;
+
+    if (current_device != device_id)
     {
-        auto& cuda_buffers = it.second;
-        for (int i = 0; i < cuda_buffers.size(); i++)
-        {
-            if (cuda_buffers[i].data == ptr) 
-            {
-                no_busy_cnt_[it.first] += cuda_buffers[i].byte_size;
-                cuda_buffers[i].busy = false;
-                return;
-            }
-        }
-        auto& big_buffers = big_buffers_map_[it.first];
-        for (int i = 0; i < big_buffers.size(); i++) 
-        {
-            if (big_buffers[i].data == ptr) 
-            {
-                big_buffers[i].busy = false;
-                return;
-            }
-        }
+        const cudaError_t restore_state = cudaSetDevice(current_device);
+        CHECK(restore_state == cudaSuccess);
     }
-    state = cudaFree(ptr);
-    CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device";
+}
+
+void CUDADeviceAllocator::trim_idle_buffers_if_needed(int device_id) const
+{
+    const size_t small_idle = no_busy_cnt_[device_id];
+    const size_t big_idle = big_no_busy_cnt_[device_id];
+    if (big_idle > kIdleBufferCacheLimit ||
+        small_idle > kIdleBufferCacheLimit - big_idle)
+    {
+        release_idle_buffers(device_id);
+    }
 }
 
 std::shared_ptr<CUDADeviceAllocator> CUDADeviceAllocatorFactory::instance = nullptr;

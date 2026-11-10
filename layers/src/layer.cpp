@@ -57,7 +57,7 @@ void BaseLayer::set_device_type(DeviceType device_type)
 }
 
 Layer::Layer(DeviceType device_type, LayerType layer_type, std::string layer_name)
-    : BaseLayer(device_type, layer_type, DataType::kDataTypeFp32, std::move(layer_name))
+    : BaseLayer(device_type, layer_type, DataType::kDataTypeFp16, std::move(layer_name))
 {
 
 }
@@ -229,10 +229,11 @@ Status LayerParam::set_weight(int32_t idx, const Tensor& weight)
 {
     CHECK_GE(idx, 0);
     CHECK_LT(idx, weights_.size());
-    CHECK(weight.data_type() == DataType::kDataTypeFp32);
-    if (!weight.is_empty())
+    if (!weight.is_empty() && weight.device_type() != device_type_ &&
+        !(device_type_ == DeviceType::kDeviceCUDA &&
+          weight.device_type() == DeviceType::kDeviceCPU))
     {
-        CHECK(weight.device_type() == device_type_);
+        return InvalidArgument("The weight tensor has a wrong device type.");
     }
     weights_.at(idx) = weight;
     return Success();
@@ -260,14 +261,15 @@ Status LayerParam::set_weight(int32_t idx, const std::vector<int32_t>& dims, con
     CHECK_LT(idx, weights_.size());
     CHECK_NE(weight_ptr, nullptr);
 
-    size_t size = std::accumulate(dims.begin(), dims.end(), sizeof(float), std::multiplies<>());
+    size_t count = std::accumulate(dims.begin(), dims.end(), size_t{1}, std::multiplies<>());
+    size_t size = count * DataTypeSize(DataType::kDataTypeFp16);
     std::shared_ptr<Buffer> buffer = std::make_shared<Buffer>(size, nullptr, const_cast<void*>(weight_ptr), true);
     if (device_type != DeviceType::kDeviceUnknown)
     {
         buffer->set_device_type(device_type);
     }
 
-    Tensor weight(DataType::kDataTypeFp32, dims);
+    Tensor weight(DataType::kDataTypeFp16, dims);
     weight.set_device_type(device_type);
     CHECK(weight.assign(buffer));
     weights_.at(idx) = weight;

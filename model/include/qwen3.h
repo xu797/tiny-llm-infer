@@ -52,16 +52,22 @@ public:
     ~Qwen3Model() override;
 
     Status init(DeviceType device_type) override;
+    Status set_weight_quantization(int32_t group_size);
     Status estimate_paged_kv_cache_blocks(int32_t block_size, int32_t max_batch_tokens,
                                           float memory_utilization, int32_t& num_blocks) const;
     size_t paged_kv_cache_size_bytes(int32_t num_blocks, int32_t block_size) const;
     Status configure_paged_kv_cache(int32_t num_blocks, int32_t block_size,
                                     int32_t max_batch_tokens);
+    int32_t vocab_size() const { return config_ ? config_->vocab_size_ : 0; }
+    DeviceType device_type() const { return device_type_; }
     Status forward_paged_batch(const std::vector<int32_t>& token_ids,
                                const std::vector<int32_t>& positions,
                                const std::vector<std::vector<int32_t>>& block_tables,
                                const std::vector<size_t>& sample_rows,
-                               std::vector<std::vector<float>>& logits);
+                               std::vector<std::vector<float>>& logits,
+                               const std::vector<float>* temperatures = nullptr,
+                               const std::vector<uint64_t>* seeds = nullptr,
+                               std::vector<int32_t>* sampled_tokens = nullptr);
     std::vector<int32_t> tokenize_prompt(const std::string& prompt) const;
     std::string decode_tokens(const std::vector<int32_t>& token_ids) const;
 
@@ -78,9 +84,11 @@ protected:
 private:
     struct SafeTensorInfo
     {
+        std::string filename;
         std::vector<int32_t> shape;
         size_t begin = 0;
         size_t end = 0;
+        size_t data_start = 0;
         std::string dtype;
     };
 
@@ -90,12 +98,13 @@ private:
     void init_mem();
 
     Status embedding(const std::vector<int32_t>& tokens, EmbeddingOutput& output) const;
-    float* load_weight(const std::string& name, const std::vector<int32_t>& expected_shape);
+    uint16_t* load_weight(const std::string& name, const std::vector<int32_t>& expected_shape);
     Status read_qwen3_config(ModelConfig& config);
     Status map_safetensors_file();
     void release_safetensors_map();
 
     int32_t requested_seq_len_ = 2048;
+    int32_t quant_group_size_ = 0;
     int32_t qwen_head_dim_ = 0;
     float rms_norm_eps_ = 1e-6f;
     float rope_theta_ = 1000000.0f;
@@ -112,8 +121,10 @@ private:
     size_t safetensors_file_size_ = 0;
     size_t safetensors_data_start_ = 0;
     std::unordered_map<std::string, SafeTensorInfo> safetensors_;
-    std::vector<std::unique_ptr<float[]>> weight_storage_;
+    std::unordered_map<std::string, std::pair<int, void*>> safetensors_maps_;
+    std::vector<std::unique_ptr<uint16_t[]>> weight_storage_;
     std::string weight_loading_error_;
+    bool is_qwen3_ = true;
 };
 
 }  // namespace my_vllm

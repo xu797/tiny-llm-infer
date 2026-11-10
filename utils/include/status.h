@@ -34,6 +34,8 @@ enum class DataType : uint8_t
     kDataTypeUnknown = 0,
     kDataTypeFp32 = 1,
     kDataTypeInt32 = 2,
+    kDataTypeInt8 = 3,
+    kDataTypeFp16 = 4,
 };
 
 enum class ModelType : uint8_t 
@@ -52,6 +54,14 @@ inline size_t DataTypeSize(DataType data_type)
     {
         return sizeof(int32_t);
     } 
+    else if (data_type == DataType::kDataTypeInt8)
+    {
+        return sizeof(int8_t);
+    }
+    else if (data_type == DataType::kDataTypeFp16)
+    {
+        return sizeof(uint16_t);
+    }
     else 
     {
         return 0;

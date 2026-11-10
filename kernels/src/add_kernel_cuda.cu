@@ -1,17 +1,16 @@
 #include "add_kernel_cuda.cuh"
+#include <cuda_fp16.h>
 
 namespace my_vllm 
 {
 
-__global__ void add_kernel_cu_fp32(int32_t size, const float* in1, const float* in2, float* out) {
+__global__ void add_kernel_cu_fp16(int32_t size, const __half* in1, const __half* in2, __half* out) {
     int32_t tid = threadIdx.x + blockDim.x * blockIdx.x;
     if (tid >= size)
     {
         return;
     }
-    float in_val1 = in1[tid];
-    float in_val2 = in2[tid];
-    out[tid] = in_val1 + in_val2;
+    out[tid] = __hadd(in1[tid], in2[tid]);
 }
 
 void add_kernel_cu(const Tensor& input1, const Tensor& input2,
@@ -28,11 +27,17 @@ void add_kernel_cu(const Tensor& input1, const Tensor& input2,
     if (stream) 
     {
         cudaStream_t stream_ = static_cast<CUstream_st*>(stream);
-        add_kernel_cu_fp32<<<block_num, thread_num, 0, stream_>>>(size, input1.ptr<float>(), input2.ptr<float>(), const_cast<float*>(output.ptr<float>()));
+        add_kernel_cu_fp16<<<block_num, thread_num, 0, stream_>>>(size,
+            reinterpret_cast<const __half*>(input1.ptr<uint16_t>()),
+            reinterpret_cast<const __half*>(input2.ptr<uint16_t>()),
+            reinterpret_cast<__half*>(const_cast<uint16_t*>(output.ptr<uint16_t>())));
     } 
     else 
     {
-        add_kernel_cu_fp32<<<block_num, thread_num>>>(size, input1.ptr<float>(), input2.ptr<float>(), const_cast<float*>(output.ptr<float>()));
+        add_kernel_cu_fp16<<<block_num, thread_num>>>(size,
+            reinterpret_cast<const __half*>(input1.ptr<uint16_t>()),
+            reinterpret_cast<const __half*>(input2.ptr<uint16_t>()),
+            reinterpret_cast<__half*>(const_cast<uint16_t*>(output.ptr<uint16_t>())));
     }
 }
 }  

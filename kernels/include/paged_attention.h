@@ -1,6 +1,8 @@
 #ifndef MYVLLM_KERNELS_PAGED_ATTENTION_H_
 #define MYVLLM_KERNELS_PAGED_ATTENTION_H_
 
+#include <vector>
+
 #include "cuda_config.h"
 #include "tensor.h"
 
@@ -26,6 +28,9 @@ void paged_attention_batch_cuda(
     const Tensor& output, const Tensor& query, const Tensor& score,
     const Tensor& key_cache, const Tensor& value_cache,
     const Tensor& block_tables, CudaConfig* config);
+
+void gather_rows_cuda(int32_t row_width, const std::vector<int32_t>& row_indices,
+                      const Tensor& source, const Tensor& output, CudaConfig* config);
 }
 
 #endif

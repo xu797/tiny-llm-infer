@@ -1,5 +1,6 @@
 #include "embed_kernel_cpu.h"
 #include "cpu_alloc.h"
+#include "fp16.h"
 
 namespace my_vllm 
 {
@@ -29,11 +30,11 @@ void emb_kernel_normal(const Tensor& input, const Tensor& weight,
         } 
         else 
         {
-            float* dest_ptr = const_cast<float*>(output.ptr<float>(i * weight_dim));
-            float* src_ptr = const_cast<float*>(weight.ptr<float>(token * weight_dim));
+            uint16_t* dest_ptr = const_cast<uint16_t*>(output.ptr<uint16_t>(i * weight_dim));
+            const uint16_t* src_ptr = weight.ptr<uint16_t>(token * weight_dim);
             if (weight.device_type() == DeviceType::kDeviceCPU) 
             {
-                allocator->memcpy(src_ptr, dest_ptr, weight_dim * sizeof(float), MemcpyKind::kMemcpyCPU2CPU);
+                allocator->memcpy(src_ptr, dest_ptr, weight_dim * sizeof(uint16_t), MemcpyKind::kMemcpyCPU2CPU);
             } 
             else 
             {

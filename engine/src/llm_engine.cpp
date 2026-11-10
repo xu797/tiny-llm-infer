@@ -63,6 +63,7 @@ Status LLMEngine::add_request(std::vector<int32_t> prompt_tokens, SamplingParams
         return InvalidArgument("The requested completion exceeds max_model_len.");
     }
 
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
     request_id = next_request_id_++;
     auto sequence = std::make_shared<Sequence>(request_id, std::move(prompt_tokens),
                                                 sampling, config_.scheduler.block_size);
@@ -85,6 +86,27 @@ Status LLMEngine::sample(const std::vector<float>& logits, Sequence& sequence,
     }
 
     const float max_logit = *std::max_element(logits.begin(), logits.end());
+    if (sequence.sampling.top_p >= 1.0f)
+    {
+        std::vector<float> cumulative_weights(logits.size());
+        const float inverse_temperature = 1.0f / sequence.sampling.temperature;
+        float total = 0.0f;
+        for (size_t index = 0; index < logits.size(); ++index)
+        {
+            total += std::exp((logits[index] - max_logit) * inverse_temperature);
+            cumulative_weights[index] = total;
+        }
+
+        std::uniform_real_distribution<float> distribution(0.0f, total);
+        const float threshold = distribution(sequence.rng());
+        const auto selected = std::lower_bound(cumulative_weights.begin(),
+                                               cumulative_weights.end(), threshold);
+        token_id = static_cast<int32_t>(std::min(
+            static_cast<size_t>(std::distance(cumulative_weights.begin(), selected)),
+            logits.size() - 1));
+        return Success();
+    }
+
     std::vector<double> weights(logits.size());
     const double inverse_temperature = 1.0 / sequence.sampling.temperature;
     for (size_t index = 0; index < logits.size(); ++index)
@@ -131,7 +153,11 @@ Status LLMEngine::step(std::vector<GenerationResult>& completed)
         return InternalError("Initialize the engine before stepping it.");
     }
     BatchPlan plan;
-    Status status = scheduler_.schedule(plan);
+    Status status;
+    {
+        std::lock_guard<std::mutex> lock(scheduler_mutex_);
+        status = scheduler_.schedule(plan);
+    }
     if (not status) return status;
     if (plan.sequences.empty()) return Success();
 
@@ -149,7 +175,7 @@ Status LLMEngine::step(std::vector<GenerationResult>& completed)
             batch_tokens.push_back({sequence.token_at(position),
                                     static_cast<int32_t>(position), sequence.block_table});
         }
-        if (not plan.is_prefill or end == sequence.size())
+        if (not item.is_prefill or end == sequence.size())
         {
             sample_rows.push_back(batch_tokens.size() - 1);
             sample_sequence_indices.push_back(index);
@@ -157,25 +183,58 @@ Status LLMEngine::step(std::vector<GenerationResult>& completed)
     }
 
     std::vector<std::vector<float>> sampled_logits;
-    status = runner_.run_batch(batch_tokens, sample_rows, sampled_logits);
-    if (not status) return status;
-    if (sampled_logits.size() != sample_rows.size())
-    {
-        return InternalError("The model runner returned the wrong number of logits rows.");
-    }
     std::vector<int32_t> sampled(plan.sequences.size(), -1);
-    for (size_t index = 0; index < sampled_logits.size(); ++index)
+    bool can_sample_on_runner = true;
+    std::vector<float> temperatures;
+    std::vector<uint64_t> seeds;
+    temperatures.reserve(sample_sequence_indices.size());
+    for (const size_t sequence_index : sample_sequence_indices)
     {
-        const size_t sequence_index = sample_sequence_indices[index];
-        status = sample(sampled_logits[index], *plan.sequences[sequence_index].sequence,
-                        sampled[sequence_index]);
+        const Sequence& sequence = *plan.sequences[sequence_index].sequence;
+        if (sequence.sampling.top_p < 1.0f) can_sample_on_runner = false;
+        temperatures.push_back(sequence.sampling.temperature);
+    }
+    if (can_sample_on_runner)
+    {
+        seeds.reserve(sample_sequence_indices.size());
+        for (const size_t sequence_index : sample_sequence_indices)
+            seeds.push_back(plan.sequences[sequence_index].sequence->rng()());
+    }
+    if (can_sample_on_runner)
+    {
+        std::vector<int32_t> sampled_tokens;
+        status = runner_.run_batch_sampled(batch_tokens, sample_rows, temperatures, seeds,
+                                           sampled_tokens);
         if (not status) return status;
+        if (sampled_tokens.size() != sample_rows.size())
+            return InternalError("The model runner returned the wrong number of sampled tokens.");
+        for (size_t index = 0; index < sampled_tokens.size(); ++index)
+            sampled[sample_sequence_indices[index]] = sampled_tokens[index];
+    }
+    else
+    {
+        status = runner_.run_batch(batch_tokens, sample_rows, sampled_logits);
+        if (not status) return status;
+        if (sampled_logits.size() != sample_rows.size())
+            return InternalError("The model runner returned the wrong number of logits rows.");
+        for (size_t index = 0; index < sampled_logits.size(); ++index)
+        {
+            const size_t sequence_index = sample_sequence_indices[index];
+            status = sample(sampled_logits[index], *plan.sequences[sequence_index].sequence,
+                            sampled[sequence_index]);
+            if (not status) return status;
+        }
     }
 
-    status = scheduler_.postprocess(plan, sampled, [this](int32_t token) {
-        return runner_.is_eos(token);
-    });
+    {
+        std::lock_guard<std::mutex> lock(scheduler_mutex_);
+        status = scheduler_.postprocess(plan, sampled, [this](int32_t token) {
+            return runner_.is_eos(token);
+        });
+    }
     if (not status) return status;
+    total_generated_tokens_ += static_cast<uint64_t>(std::count_if(
+        sampled.begin(), sampled.end(), [](int32_t token) { return token >= 0; }));
     for (const ScheduledSequence& item : plan.sequences)
     {
         if (item.sequence->status != SequenceStatus::kFinished) continue;
@@ -259,6 +318,7 @@ Status LLMEngine::generate(const std::vector<std::string>& prompts,
 
 bool LLMEngine::is_finished() const
 {
+    std::lock_guard<std::mutex> lock(scheduler_mutex_);
     return scheduler_.is_finished();
 }
 }

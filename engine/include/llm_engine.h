@@ -2,6 +2,7 @@
 #define MYVLLM_ENGINE_LLM_ENGINE_H_
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,7 @@ public:
                     std::vector<GenerationResult>& results);
 
     bool is_finished() const;
+    uint64_t total_generated_tokens() const { return total_generated_tokens_; }
     const Scheduler& scheduler() const { return scheduler_; }
 
 private:
@@ -49,6 +51,8 @@ private:
     Scheduler scheduler_;
     bool initialized_ = false;
     uint64_t next_request_id_ = 1;
+    uint64_t total_generated_tokens_ = 0;
+    mutable std::mutex scheduler_mutex_;
 };
 }
 

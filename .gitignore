@@ -18,5 +18,11 @@ llama2/
 
 Qwen3-0.6B/
 
+Qwen2.5-3B-Instruct/
+
+*.csv
+
+vllm-env
+
 **/test/
 tools/

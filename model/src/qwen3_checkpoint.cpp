@@ -16,8 +16,10 @@ namespace my_vllm
 Status Qwen3Model::read_qwen3_config(ModelConfig& config)
 {
     using json = nlohmann::json;
-    const std::filesystem::path config_path =
-        std::filesystem::path(model_path_).parent_path() / "config.json";
+    const std::filesystem::path supplied_model_path(model_path_);
+    const std::filesystem::path config_dir = std::filesystem::is_directory(supplied_model_path)
+        ? supplied_model_path : supplied_model_path.parent_path();
+    const std::filesystem::path config_path = config_dir / "config.json";
     std::ifstream input(config_path);
     if (!input)
         return PathNotValid("Cannot open the Qwen3 config file: " + config_path.string());
@@ -25,8 +27,10 @@ Status Qwen3Model::read_qwen3_config(ModelConfig& config)
     try
     {
         const json data = json::parse(input);
-        if (data.value("model_type", std::string()) != "qwen3")
-            return ModelParseError("The config.json next to the weights is not a Qwen3 model.");
+        const std::string model_type = data.value("model_type", std::string());
+        if (model_type != "qwen3" && model_type != "qwen2")
+            return ModelParseError("Only Qwen2 and Qwen3 model configs are supported.");
+        is_qwen3_ = model_type == "qwen3";
 
         qwen_head_dim_ = data.value("head_dim", 0);
         rms_norm_eps_ = data.value("rms_norm_eps", 1e-6f);
@@ -39,6 +43,7 @@ Status Qwen3Model::read_qwen3_config(ModelConfig& config)
         config.vocab_size = data.at("vocab_size").get<int32_t>();
         const int32_t model_context = data.at("max_position_embeddings").get<int32_t>();
         config.seq_len = std::min(requested_seq_len_, model_context);
+        if (qwen_head_dim_ == 0) qwen_head_dim_ = config.dim / config.head_num;
     }
     catch (const std::exception& error)
     {
@@ -50,67 +55,104 @@ Status Qwen3Model::read_qwen3_config(ModelConfig& config)
 
 Status Qwen3Model::map_safetensors_file()
 {
-    safetensors_fd_ = open(model_path_.c_str(), O_RDONLY);
-    if (safetensors_fd_ < 0)
-        return PathNotValid("Cannot open the Qwen3 safetensors file: " + model_path_);
-
-    struct stat file_stat {};
-    if (fstat(safetensors_fd_, &file_stat) != 0 || file_stat.st_size < 8)
+    namespace fs = std::filesystem;
+    const fs::path supplied(model_path_);
+    const fs::path model_dir = fs::is_directory(supplied) ? supplied : supplied.parent_path();
+    fs::path index_path = model_dir / "model.safetensors.index.json";
+    std::unordered_map<std::string, std::string> tensor_files;
+    if (fs::exists(index_path))
     {
-        release_safetensors_map();
-        return ModelParseError("The Qwen3 safetensors file is too small or cannot be read.");
+        try
+        {
+            std::ifstream index_input(index_path);
+            const auto index = nlohmann::json::parse(index_input);
+            for (auto item = index.at("weight_map").begin(); item != index.at("weight_map").end(); ++item)
+                tensor_files.emplace(item.key(), item.value().get<std::string>());
+        }
+        catch (const std::exception& error)
+        {
+            return ModelParseError(std::string("Failed to parse safetensors shard index: ") + error.what());
+        }
+    }
+    std::vector<std::string> filenames;
+    if (!tensor_files.empty())
+    {
+        for (const auto& entry : tensor_files)
+            if (std::find(filenames.begin(), filenames.end(), entry.second) == filenames.end())
+                filenames.push_back(entry.second);
+    }
+    else if (fs::is_directory(supplied))
+    {
+        return PathNotValid("The model directory does not contain model.safetensors.index.json.");
+    }
+    else
+    {
+        filenames.push_back(supplied.filename().string());
     }
 
-    safetensors_file_size_ = static_cast<size_t>(file_stat.st_size);
-    safetensors_mapping_ = mmap(nullptr, safetensors_file_size_, PROT_READ, MAP_PRIVATE,
-                                safetensors_fd_, 0);
-    if (safetensors_mapping_ == MAP_FAILED || safetensors_mapping_ == nullptr)
-    {
-        safetensors_mapping_ = nullptr;
-        release_safetensors_map();
-        return ModelParseError("Failed to map the Qwen3 safetensors file into memory.");
-    }
-
-    uint64_t header_size = 0;
-    std::memcpy(&header_size, safetensors_mapping_, sizeof(header_size));
-    if (header_size > safetensors_file_size_ - sizeof(header_size))
-    {
-        release_safetensors_map();
-        return ModelParseError("The Qwen3 safetensors header size is invalid.");
-    }
-
-    safetensors_data_start_ = sizeof(header_size) + static_cast<size_t>(header_size);
     try
     {
         using json = nlohmann::json;
-        const char* header_data =
-            static_cast<const char*>(safetensors_mapping_) + sizeof(header_size);
-        const json header = json::parse(
-            std::string(header_data, static_cast<size_t>(header_size)));
-        const size_t data_size = safetensors_file_size_ - safetensors_data_start_;
-        for (auto item = header.begin(); item != header.end(); ++item)
+        for (const std::string& filename : filenames)
         {
-            if (item.key() == "__metadata__") continue;
-
-            SafeTensorInfo info;
-            info.dtype = item.value().at("dtype").get<std::string>();
-            for (const auto& dimension : item.value().at("shape"))
-                info.shape.push_back(dimension.get<int32_t>());
-            const auto offsets = item.value().at("data_offsets");
-            info.begin = offsets.at(0).get<size_t>();
-            info.end = offsets.at(1).get<size_t>();
-            if (info.begin > info.end || info.end > data_size)
+            const fs::path shard_path = model_dir / filename;
+            const int fd = open(shard_path.c_str(), O_RDONLY);
+            if (fd < 0) throw std::runtime_error("Cannot open shard " + shard_path.string());
+            struct stat file_stat {};
+            if (fstat(fd, &file_stat) != 0 || file_stat.st_size < 8)
             {
-                release_safetensors_map();
-                return ModelParseError("A Qwen3 tensor has an invalid safetensors data offset.");
+                close(fd);
+                throw std::runtime_error("Invalid safetensors shard " + shard_path.string());
             }
-            safetensors_.emplace(item.key(), std::move(info));
+            const size_t file_size = static_cast<size_t>(file_stat.st_size);
+            void* mapping = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mapping == MAP_FAILED || !mapping)
+            {
+                close(fd);
+                throw std::runtime_error("Cannot map shard " + shard_path.string());
+            }
+            uint64_t header_size = 0;
+            std::memcpy(&header_size, mapping, sizeof(header_size));
+            if (header_size > file_size - sizeof(header_size))
+            {
+                munmap(mapping, file_size);
+                close(fd);
+                throw std::runtime_error("Invalid header in shard " + shard_path.string());
+            }
+            const size_t data_start = sizeof(header_size) + static_cast<size_t>(header_size);
+            safetensors_maps_[filename] = {fd, mapping};
+            if (safetensors_mapping_ == nullptr)
+            {
+                safetensors_fd_ = fd;
+                safetensors_mapping_ = mapping;
+                safetensors_file_size_ = file_size;
+                safetensors_data_start_ = data_start;
+            }
+            const char* header_data = static_cast<const char*>(mapping) + sizeof(header_size);
+            const json header = json::parse(std::string(header_data, static_cast<size_t>(header_size)));
+            const size_t data_size = file_size - data_start;
+            for (auto item = header.begin(); item != header.end(); ++item)
+            {
+                if (item.key() == "__metadata__") continue;
+                SafeTensorInfo info;
+                info.filename = filename;
+                info.data_start = data_start;
+                info.dtype = item.value().at("dtype").get<std::string>();
+                for (const auto& dimension : item.value().at("shape"))
+                    info.shape.push_back(dimension.get<int32_t>());
+                const auto offsets = item.value().at("data_offsets");
+                info.begin = offsets.at(0).get<size_t>();
+                info.end = offsets.at(1).get<size_t>();
+                if (info.begin > info.end || info.end > data_size)
+                    throw std::runtime_error("Invalid tensor offsets in shard " + filename);
+                safetensors_.emplace(item.key(), std::move(info));
+            }
         }
     }
     catch (const std::exception& error)
     {
         release_safetensors_map();
-        return ModelParseError(std::string("Failed to parse Qwen3 safetensors header: ") +
+        return ModelParseError(std::string("Failed to map safetensors weights: ") +
                                error.what());
     }
     return Success();
@@ -151,7 +193,14 @@ Status Qwen3Model::create_encode_layer()
 {
     try
     {
-        encode_layer_ = std::make_unique<Qwen3EncodeLayer>(token_path_, false, false);
+        const std::filesystem::path supplied_model_path(model_path_);
+        const std::filesystem::path config_dir = std::filesystem::is_directory(supplied_model_path)
+            ? supplied_model_path : supplied_model_path.parent_path();
+        const std::filesystem::path config_path = config_dir / "config.json";
+        std::ifstream config_input(config_path);
+        const auto config_json = nlohmann::json::parse(config_input);
+        encode_layer_ = std::make_unique<Qwen3EncodeLayer>(
+            token_path_, false, false, config_json.value("model_type", std::string()) == "qwen3");
     }
     catch (const std::exception& error)
     {
@@ -164,16 +213,16 @@ Status Qwen3Model::create_encode_layer()
 
 void Qwen3Model::release_safetensors_map()
 {
-    if (safetensors_mapping_ != nullptr && safetensors_mapping_ != MAP_FAILED)
+    for (const auto& entry : safetensors_maps_)
     {
-        munmap(safetensors_mapping_, safetensors_file_size_);
-        safetensors_mapping_ = nullptr;
+        struct stat file_stat {};
+        if (fstat(entry.second.first, &file_stat) == 0 && file_stat.st_size > 0)
+            munmap(entry.second.second, static_cast<size_t>(file_stat.st_size));
+        close(entry.second.first);
     }
-    if (safetensors_fd_ >= 0)
-    {
-        close(safetensors_fd_);
-        safetensors_fd_ = -1;
-    }
+    safetensors_maps_.clear();
+    safetensors_mapping_ = nullptr;
+    safetensors_fd_ = -1;
     safetensors_file_size_ = 0;
     safetensors_data_start_ = 0;
     safetensors_.clear();

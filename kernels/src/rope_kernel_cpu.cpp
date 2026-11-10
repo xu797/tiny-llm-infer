@@ -1,4 +1,5 @@
 #include "rope_kernel_cpu.h"
+#include "fp16.h"
 
 namespace my_vllm
 {
@@ -148,8 +149,8 @@ void qwen3_rope_kernel_cpu(int32_t query_heads, int32_t kv_heads, int32_t head_s
   const int32_t pos = input_pos.ptr<int32_t>()[0];
   const float* sin_row = sin_cache.ptr<float>() + pos * head_size;
   const float* cos_row = cos_cache.ptr<float>() + pos * head_size;
-  float* query = const_cast<float*>(input_q.ptr<float>());
-  float* key = const_cast<float*>(input_k.ptr<float>());
+  uint16_t* query = const_cast<uint16_t*>(input_q.ptr<uint16_t>());
+  uint16_t* key = const_cast<uint16_t*>(input_k.ptr<uint16_t>());
   const int32_t half = head_size / 2;
 
   for (int32_t head = 0; head < query_heads; ++head)
@@ -158,10 +159,10 @@ void qwen3_rope_kernel_cpu(int32_t query_heads, int32_t kv_heads, int32_t head_s
     {
       const int32_t first = head * head_size + i;
       const int32_t second = first + half;
-      const float x = query[first];
-      const float y = query[second];
-      query[first] = x * cos_row[i] - y * sin_row[i];
-      query[second] = x * sin_row[i] + y * cos_row[i];
+      const float x = fp16_to_float(query[first]);
+      const float y = fp16_to_float(query[second]);
+      query[first] = float_to_fp16(x * cos_row[i] - y * sin_row[i]);
+      query[second] = float_to_fp16(x * sin_row[i] + y * cos_row[i]);
     }
   }
   for (int32_t head = 0; head < kv_heads; ++head)
@@ -170,10 +171,10 @@ void qwen3_rope_kernel_cpu(int32_t query_heads, int32_t kv_heads, int32_t head_s
     {
       const int32_t first = head * head_size + i;
       const int32_t second = first + half;
-      const float x = key[first];
-      const float y = key[second];
-      key[first] = x * cos_row[i] - y * sin_row[i];
-      key[second] = x * sin_row[i] + y * cos_row[i];
+      const float x = fp16_to_float(key[first]);
+      const float y = fp16_to_float(key[second]);
+      key[first] = float_to_fp16(x * cos_row[i] - y * sin_row[i]);
+      key[second] = float_to_fp16(x * sin_row[i] + y * cos_row[i]);
     }
   }
 }

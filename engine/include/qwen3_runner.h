@@ -16,6 +16,11 @@ public:
     Status run_batch(const std::vector<ModelBatchToken>& tokens,
                      const std::vector<size_t>& sample_rows,
                      std::vector<std::vector<float>>& logits) override;
+    Status run_batch_sampled(const std::vector<ModelBatchToken>& tokens,
+                             const std::vector<size_t>& sample_rows,
+                             const std::vector<float>& temperatures,
+                             const std::vector<uint64_t>& seeds,
+                             std::vector<int32_t>& token_ids) override;
     Status tokenize(const std::string& prompt,
                     std::vector<int32_t>& token_ids) const override;
     std::string decode(const std::vector<int32_t>& token_ids) const override;

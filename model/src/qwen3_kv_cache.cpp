@@ -27,9 +27,9 @@ Status Qwen3Model::configure_paged_kv_cache(int32_t num_blocks, int32_t block_si
     else
         return InvalidArgument("Initialize Qwen3 before configuring its KV cache.");
 
-    Tensor key_cache(DataType::kDataTypeFp32, config_->layer_num_, num_blocks,
+    Tensor key_cache(DataType::kDataTypeFp16, config_->layer_num_, num_blocks,
                      block_size, config_->kv_dim_, true, allocator);
-    Tensor value_cache(DataType::kDataTypeFp32, config_->layer_num_, num_blocks,
+    Tensor value_cache(DataType::kDataTypeFp16, config_->layer_num_, num_blocks,
                        block_size, config_->kv_dim_, true, allocator);
     if (key_cache.is_empty() || value_cache.is_empty())
         return InternalError("Failed to allocate the requested paged KV cache pool.");

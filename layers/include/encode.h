@@ -81,7 +81,7 @@ class Qwen3EncodeLayer : public EncodeLayerBase
 {
 public:
     explicit Qwen3EncodeLayer(std::string token_model_path, bool has_bos = false,
-                              bool has_eos = false);
+                              bool has_eos = false, bool qwen3_pattern = true);
 
     std::vector<int32_t> encode(const std::string& sentence) const override;
     std::string decode(int32_t token_id) const override;
@@ -102,6 +102,7 @@ private:
     int32_t num_token_ = 0;
     int32_t eos_id_ = -1;
     int32_t endoftext_id_ = -1;
+    bool qwen3_pattern_ = true;
 };
 
 }

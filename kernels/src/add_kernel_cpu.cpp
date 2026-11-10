@@ -1,4 +1,5 @@
 #include "add_kernel_cpu.h"
+#include "fp16.h"
 
 namespace my_vllm
 {
@@ -13,9 +14,10 @@ void add_kernel_cpu(const Tensor& input1, const Tensor& input2, const Tensor& ou
     CHECK_EQ(input1.size(), input2.size());
     CHECK_EQ(input1.size(), output.size());
 
-    arma::fvec input_vec1(const_cast<float*>(input1.ptr<float>()), input1.size(), false, true);
-    arma::fvec input_vec2(const_cast<float*>(input2.ptr<float>()), input2.size(), false, true);
-    arma::fvec output_vec(const_cast<float*>(output.ptr<float>()), output.size(), false, true);
-    output_vec = input_vec1 + input_vec2;
+    const uint16_t* a = input1.ptr<uint16_t>();
+    const uint16_t* b = input2.ptr<uint16_t>();
+    uint16_t* y = const_cast<uint16_t*>(output.ptr<uint16_t>());
+    for (size_t index = 0; index < input1.size(); ++index)
+        y[index] = float_to_fp16(fp16_to_float(a[index]) + fp16_to_float(b[index]));
 }
 }
